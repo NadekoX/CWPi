@@ -1,0 +1,13 @@
+id: computer-use
+displayName: Computer Use
+logo: logo.png
+apiUrl: https://localhost.invalid
+description: Read and operate local Windows 11 apps through screenshots and accessibility APIs.
+category: productivity
+type: none
+gateway:
+  allowedPaths:
+    - '^/$'
+skills:
+  - id: computer-use
+    displayName: Computer Use

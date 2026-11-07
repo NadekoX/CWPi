@@ -1,0 +1,246 @@
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { createInterface } from "node:readline";
+import { Transform } from "node:stream";
+import { resolveDocumentFileType } from "./document-text.js";
+import { detectImageMimeType, expectedImageMimeType, isPdfBuffer } from "./media-file.js";
+
+export const MAX_FILE_BYTES = 1024 * 1024;
+
+export class TextFileReadError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "TextFileReadError";
+  }
+}
+
+export interface FileChangeDetails {
+  after: string;
+  before: string | null;
+  diff: string;
+  path: string;
+}
+
+export interface TextFilePage {
+  hasMore: boolean;
+  lines: string[];
+  totalLines: number | null;
+}
+
+async function assertTextFileFormat(path: string, signal?: AbortSignal): Promise<void> {
+  if (resolveDocumentFileType(path, "") !== null || path.toLowerCase().endsWith(".pdf")) {
+    throw new TextFileReadError("PDF 或 Office 文档无法作为 UTF-8 文本读取");
+  }
+  if (expectedImageMimeType(path) !== null) {
+    throw new TextFileReadError("图片无法作为 UTF-8 文本读取");
+  }
+
+  const handle = await open(path, "r");
+  try {
+    const prefix = Buffer.alloc(8 * 1024);
+    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+    const content = prefix.subarray(0, bytesRead);
+    if (detectImageMimeType(content) !== null) {
+      throw new TextFileReadError("图片无法作为 UTF-8 文本读取");
+    }
+    if (isPdfBuffer(content)) {
+      throw new TextFileReadError("PDF 文档无法作为 UTF-8 文本读取");
+    }
+    if (content.includes(0)) throw new TextFileReadError("二进制文件无法作为 UTF-8 文本读取");
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(content, {
+        stream: bytesRead === prefix.length,
+      });
+    } catch {
+      throw new TextFileReadError("文件不是有效的 UTF-8 文本");
+    }
+    signal?.throwIfAborted();
+  } finally {
+    await handle.close();
+  }
+}
+
+export function isFileChangeDetails(value: unknown): value is FileChangeDetails {
+  if (typeof value !== "object" || value === null) return false;
+  const details = value as Record<string, unknown>;
+  return (
+    typeof details.after === "string" &&
+    (details.before === null || typeof details.before === "string") &&
+    typeof details.diff === "string" &&
+    typeof details.path === "string"
+  );
+}
+
+export function readFileChangeDetails(value: unknown): readonly FileChangeDetails[] {
+  if (isFileChangeDetails(value)) return [value];
+  if (typeof value !== "object" || value === null || !("fileChanges" in value)) return [];
+  const fileChanges = value.fileChanges;
+  return Array.isArray(fileChanges) && fileChanges.every(isFileChangeDetails) ? fileChanges : [];
+}
+
+export async function readTextFile(path: string, signal?: AbortSignal): Promise<string> {
+  const metadata = await stat(path).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      throw new TextFileReadError("文件不存在");
+    }
+    throw error;
+  });
+  if (!metadata.isFile()) {
+    throw new TextFileReadError("所选路径不是普通文件");
+  }
+  if (metadata.size > MAX_FILE_BYTES) {
+    throw new TextFileReadError(
+      `文件大小为 ${metadata.size} 字节，超过 ${MAX_FILE_BYTES} 字节（1 MiB）的预览上限`,
+    );
+  }
+  await assertTextFileFormat(path, signal);
+  const content = await readFile(path, signal === undefined ? undefined : { signal });
+  if (content.byteLength > MAX_FILE_BYTES) {
+    throw new TextFileReadError(
+      `文件大小为 ${content.byteLength} 字节，超过 ${MAX_FILE_BYTES} 字节（1 MiB）的预览上限`,
+    );
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    throw new TextFileReadError("文件不是有效的 UTF-8 文本");
+  }
+}
+
+export async function readTextFilePage(
+  path: string,
+  offset: number,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<TextFilePage> {
+  await assertTextFileFormat(path, signal);
+  const handle = await open(path, "r");
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error("文件不是普通文件");
+
+    const lastByte = Buffer.allocUnsafe(1);
+    const hasTrailingLineFeed =
+      metadata.size > 0 && (await handle.read(lastByte, 0, 1, metadata.size - 1)).bytesRead === 1
+        ? lastByte[0] === 0x0a
+        : false;
+    const source = handle.createReadStream({
+      autoClose: false,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const input = source.pipe(
+      new Transform({
+        flush(callback) {
+          try {
+            callback(null, decoder.decode());
+          } catch {
+            callback(new Error("read_file 仅支持有效的 UTF-8 文本文件"));
+          }
+        },
+        transform(chunk: Buffer, _encoding, callback) {
+          try {
+            callback(null, decoder.decode(chunk, { stream: true }));
+          } catch {
+            callback(new Error("read_file 仅支持有效的 UTF-8 文本文件"));
+          }
+        },
+      }),
+    );
+    let currentLineBytes = 0;
+    const checkLineSize = (chunk: Buffer | string) => {
+      const parts = (typeof chunk === "string" ? chunk : chunk.toString("utf8")).split("\n");
+      currentLineBytes += Buffer.byteLength(parts[0] ?? "", "utf8");
+      if (currentLineBytes > MAX_FILE_BYTES) {
+        input.destroy(new Error(`单行内容超过 ${MAX_FILE_BYTES} 字节限制`));
+        return;
+      }
+      for (const part of parts.slice(1, -1)) {
+        if (Buffer.byteLength(part, "utf8") > MAX_FILE_BYTES) {
+          input.destroy(new Error(`单行内容超过 ${MAX_FILE_BYTES} 字节限制`));
+          return;
+        }
+      }
+      if (parts.length > 1) {
+        currentLineBytes = Buffer.byteLength(parts.at(-1) ?? "", "utf8");
+        if (currentLineBytes > MAX_FILE_BYTES) {
+          input.destroy(new Error(`单行内容超过 ${MAX_FILE_BYTES} 字节限制`));
+        }
+      }
+    };
+    input.on("data", checkLineSize);
+    const reader = createInterface({ crlfDelay: Number.POSITIVE_INFINITY, input });
+    const lines: string[] = [];
+    let lineNumber = 0;
+    let selectedBytes = 0;
+    let stoppedEarly = false;
+
+    const appendLine = (line: string): boolean => {
+      if (lineNumber < offset) return true;
+      const lineBytes = Buffer.byteLength(line, "utf8") + (lines.length === 0 ? 0 : 1);
+      if (lines.length === limit || selectedBytes + lineBytes > MAX_FILE_BYTES) {
+        stoppedEarly = true;
+        return false;
+      }
+      lines.push(line);
+      selectedBytes += lineBytes;
+      return true;
+    };
+
+    try {
+      for await (const line of reader) {
+        lineNumber += 1;
+        if (!appendLine(line)) break;
+      }
+    } finally {
+      input.removeListener("data", checkLineSize);
+      reader.close();
+      source.unpipe(input);
+      source.destroy();
+      input.destroy();
+    }
+
+    if (!stoppedEarly && (metadata.size === 0 || hasTrailingLineFeed)) {
+      lineNumber += 1;
+      appendLine("");
+    }
+
+    return {
+      hasMore: stoppedEarly,
+      lines,
+      totalLines: stoppedEarly ? null : lineNumber,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+export function assertTextFileSize(content: string): void {
+  if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+    throw new Error(`文件内容超过 ${MAX_FILE_BYTES} 字节限制`);
+  }
+}
+
+export async function writeTextFileAtomic(
+  path: string,
+  content: string,
+  mode: number | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporaryPath = resolve(dirname(path), `.${randomUUID()}.tmp`);
+  try {
+    signal?.throwIfAborted();
+    await writeFile(temporaryPath, content, {
+      encoding: "utf8",
+      ...(signal === undefined ? {} : { signal }),
+    });
+    signal?.throwIfAborted();
+    if (mode !== undefined) await chmod(temporaryPath, mode);
+    signal?.throwIfAborted();
+    await rename(temporaryPath, path);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}

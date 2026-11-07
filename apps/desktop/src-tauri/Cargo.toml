@@ -1,0 +1,12 @@
+[package]
+name = "cwpi-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+getrandom = { version = "0.3", features = ["std"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"

@@ -1,0 +1,63 @@
+id: google
+displayName: Google
+apiUrl: https://www.googleapis.com
+description: Work with Google Drive, Docs, Sheets, Slides, and Calendar through Skills and Workspace MCP.
+category: productivity
+type: oauth
+gateway:
+  allowedPaths:
+    - '^/drive/v3/files(?:/[^/]+)?/?$'
+    - '^/drive/v3/files/[^/]+/export/?$'
+    - '^/drive/v3/files/[^/]+/comments(?:/[^/]+(?:/replies(?:/[^/]+)?)?)?/?$'
+    - '^/calendar/v3/users/[^/]+/calendarList/?$'
+    - '^/calendar/v3/calendars/[^/]+/events(?:/[^/]+)?/?$'
+oauth:
+  authorizationParams:
+    access_type: offline
+    prompt: consent
+  authorizationPath: https://accounts.google.com/o/oauth2/v2/auth
+  callbackUrl: http://127.0.0.1:4310/api/skill-connections/google/oauth/callback
+  tokenPath: https://oauth2.googleapis.com/token
+  clientId: ''
+  clientSecret: ''
+  pkce: true
+  tokenAuth: body
+  tokenFormat: form
+  scopes:
+    - openid
+    - email
+    - profile
+    - https://www.googleapis.com/auth/drive.readonly
+    - https://www.googleapis.com/auth/drive.file
+    - https://www.googleapis.com/auth/documents.readonly
+    - https://www.googleapis.com/auth/documents
+    - https://www.googleapis.com/auth/spreadsheets.readonly
+    - https://www.googleapis.com/auth/spreadsheets
+    - https://www.googleapis.com/auth/presentations.readonly
+    - https://www.googleapis.com/auth/presentations
+    - https://www.googleapis.com/auth/calendar.calendarlist.readonly
+    - https://www.googleapis.com/auth/calendar.events.freebusy
+    - https://www.googleapis.com/auth/calendar.events.readonly
+    - https://www.googleapis.com/auth/calendar.events
+  profile:
+    source: id-token
+    idField: sub
+    usernameField: email
+    displayNameField: name
+    avatarUrlField: picture
+skills:
+  - id: google-drive
+    displayName: Drive 文件工作流
+    icon: google-drive.svg
+  - id: google-drive-comments
+    displayName: Drive 评论审阅
+    icon: google-drive.svg
+  - id: google-docs
+    displayName: Google 文档
+    icon: google-drive.svg
+  - id: google-sheets
+    displayName: Google 表格
+    icon: google-drive.svg
+  - id: google-slides
+    displayName: Google 幻灯片
+    icon: google-drive.svg

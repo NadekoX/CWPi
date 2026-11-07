@@ -1,0 +1,521 @@
+import {
+  type ApprovalResponseDecision,
+  type CommandProcessSnapshot,
+  type HarnessEvent,
+  HarnessEventType,
+} from "@cwpi/agent-runtime/harness-event";
+import {
+  ThinkingLevel,
+  type ThinkingLevel as ThinkingLevelValue,
+} from "@cwpi/agent-runtime/thinking-level";
+import type {
+  QueuedRunInput,
+  RunUserInput,
+  UserInputSubmission,
+} from "@cwpi/agent-runtime/user-input";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
+import { apiRequest } from "../../../api/request";
+
+const SessionSchema = Type.Object({
+  createdAt: Type.Integer({ minimum: 0 }),
+  id: Type.String({ minLength: 1 }),
+  isRunning: Type.Optional(Type.Boolean()),
+  lastSeq: Type.Integer({ minimum: 0 }),
+  modelId: Type.String({ minLength: 1 }),
+  providerId: Type.String({ minLength: 1 }),
+  thinkingLevel: Type.Union([
+    Type.Literal(ThinkingLevel.OFF),
+    Type.Literal(ThinkingLevel.MINIMAL),
+    Type.Literal(ThinkingLevel.LOW),
+    Type.Literal(ThinkingLevel.MEDIUM),
+    Type.Literal(ThinkingLevel.HIGH),
+    Type.Literal(ThinkingLevel.XHIGH),
+    Type.Literal(ThinkingLevel.MAX),
+  ]),
+  title: Type.String({ minLength: 1 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+  workspaceId: Type.String({ minLength: 1 }),
+  workspaceRoot: Type.String({ minLength: 1 }),
+});
+
+const HarnessEventSchema = Type.Object({
+  data: Type.Unknown(),
+  id: Type.String({ minLength: 1 }),
+  runId: Type.Optional(Type.String({ minLength: 1 })),
+  seq: Type.Integer({ minimum: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  timestamp: Type.Integer({ minimum: 0 }),
+  type: Type.String({ minLength: 1 }),
+});
+
+const CommandProcessSchema = Type.Object({
+  command: Type.String(),
+  durationMs: Type.Number({ minimum: 0 }),
+  endedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+  exitCode: Type.Union([Type.Integer(), Type.Null()]),
+  output: Type.String(),
+  outputBytes: Type.Integer({ minimum: 0 }),
+  processId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 }),
+  sandbox: Type.Union([Type.Literal("host"), Type.Literal("isolated")]),
+  sessionId: Type.String({ minLength: 1 }),
+  signal: Type.Union([Type.String(), Type.Null()]),
+  startedAt: Type.Integer({ minimum: 0 }),
+  status: Type.Union([
+    Type.Literal("running"),
+    Type.Literal("completed"),
+    Type.Literal("failed"),
+    Type.Literal("stopped"),
+    Type.Literal("timed_out"),
+    Type.Literal("aborted"),
+    Type.Literal("daemon_stopped"),
+  ]),
+  toolCallId: Type.String({ minLength: 1 }),
+  truncated: Type.Boolean(),
+});
+
+const SessionListSchema = Type.Array(SessionSchema);
+const SessionSnapshotSchema = Type.Object({
+  commands: Type.Array(CommandProcessSchema),
+  events: Type.Array(HarnessEventSchema),
+  lastPersistedSeq: Type.Integer({ minimum: 0 }),
+  session: SessionSchema,
+});
+const SubAgentEventsSchema = Type.Object({
+  events: Type.Array(HarnessEventSchema),
+  hasMore: Type.Boolean(),
+});
+const SessionSearchResultSchema = Type.Object({
+  description: Type.String({ maxLength: 160 }),
+  excerpt: Type.String({ maxLength: 502 }),
+  messageEventId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+  session: SessionSchema,
+});
+const SessionSearchResultListSchema = Type.Array(SessionSearchResultSchema);
+const RunAcceptedSchema = Type.Object({
+  runId: Type.String({ minLength: 1 }),
+  title: Type.String({ maxLength: 200, minLength: 1 }),
+});
+const QueuedRunInputSchema = Type.Object({
+  attachments: Type.Array(
+    Type.Object({
+      contentIndex: Type.Optional(Type.Integer({ minimum: 0 })),
+      mimeType: Type.String({ minLength: 1 }),
+      name: Type.String({ minLength: 1 }),
+      size: Type.Integer({ minimum: 0 }),
+    }),
+  ),
+  createdAt: Type.Integer({ minimum: 0 }),
+  id: Type.String({ minLength: 1 }),
+  prompt: Type.String(),
+  references: Type.Array(
+    Type.Object({
+      kind: Type.Union([Type.Literal("file"), Type.Literal("folder"), Type.Literal("image")]),
+      path: Type.String({ minLength: 1 }),
+    }),
+  ),
+});
+const QueuedRunInputListSchema = Type.Array(QueuedRunInputSchema);
+
+export type Session = Static<typeof SessionSchema>;
+export interface SessionSnapshotEventMetadata {
+  changedRunIds: ReadonlySet<string>;
+  stableEvents: readonly HarnessEvent[];
+  transientByKey: ReadonlyMap<string, HarnessEvent>;
+}
+export interface SessionSnapshot {
+  commands: readonly CommandProcessSnapshot[];
+  /** Client-only incremental state. The daemon response never includes this field. */
+  eventMetadata?: SessionSnapshotEventMetadata;
+  events: readonly HarnessEvent[];
+  lastPersistedSeq: number;
+  /** Client-only messages shown until the daemon persists the submitted user messages. */
+  optimisticUserInputs?: readonly OptimisticSessionUserInput[];
+  session: Session;
+}
+export interface OptimisticSessionUserInput {
+  id: string;
+  input: RunUserInput;
+  timestamp: number;
+}
+export type SessionSearchResult = Static<typeof SessionSearchResultSchema>;
+export type RunAccepted = Static<typeof RunAcceptedSchema>;
+
+export interface CreateSessionInput {
+  modelId: string;
+  providerId: string;
+  thinkingLevel: ThinkingLevelValue;
+  title?: string;
+  workspaceId: string;
+}
+
+export interface UpdateSessionInput {
+  archived?: boolean;
+  title?: string;
+}
+
+const EVENT_TYPES = new Set<string>(Object.values(HarnessEventType));
+
+function parseEvent(value: unknown): HarnessEvent {
+  if (!Value.Check(HarnessEventSchema, value) || !EVENT_TYPES.has(value.type)) {
+    throw new Error("daemon 返回了无效的 Session 事件");
+  }
+  return value as HarnessEvent;
+}
+
+async function readSession(response: Response): Promise<Session> {
+  const body = (await response.json()) as unknown;
+  if (!Value.Check(SessionSchema, body)) throw new Error("daemon 返回了无效的 Session 响应");
+  return body;
+}
+
+export async function listSessions(
+  archived = false,
+  signal?: AbortSignal,
+): Promise<readonly Session[]> {
+  const body = (await (
+    await apiRequest(
+      archived ? "/api/sessions?archived=true" : "/api/sessions",
+      signal ? { signal } : undefined,
+    )
+  ).json()) as unknown;
+  if (!Value.Check(SessionListSchema, body)) throw new Error("daemon 返回了无效的 Session 列表");
+  return body;
+}
+
+export async function searchSessions(
+  query: string,
+  signal?: AbortSignal,
+): Promise<readonly SessionSearchResult[]> {
+  const body = (await (
+    await apiRequest(
+      `/api/sessions/search?query=${encodeURIComponent(query.trim())}`,
+      signal ? { signal } : undefined,
+    )
+  ).json()) as unknown;
+  if (!Value.Check(SessionSearchResultListSchema, body)) {
+    throw new Error("daemon 返回了无效的 Session 搜索结果");
+  }
+  return body;
+}
+
+export async function createSession(input: CreateSessionInput): Promise<Session> {
+  return readSession(
+    await apiRequest("/api/sessions", { body: JSON.stringify(input), method: "POST" }),
+  );
+}
+
+export async function getSessionSnapshot(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<SessionSnapshot> {
+  return readSessionSnapshot(
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}/conversation`,
+      signal ? { signal } : undefined,
+    ),
+  );
+}
+
+export async function getSessionTraceSnapshot(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<SessionSnapshot> {
+  return readSessionSnapshot(
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}`,
+      signal ? { signal } : undefined,
+    ),
+  );
+}
+
+async function readSessionSnapshot(response: Response): Promise<SessionSnapshot> {
+  const body = (await response.json()) as unknown;
+  if (!Value.Check(SessionSnapshotSchema, body)) {
+    throw new Error("daemon 返回了无效的 Session 快照");
+  }
+  return {
+    commands: body.commands as readonly CommandProcessSnapshot[],
+    events: body.events.map(parseEvent),
+    lastPersistedSeq: body.lastPersistedSeq,
+    session: body.session,
+  };
+}
+
+export async function stopSessionCommand(sessionId: string, processId: string): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/commands/${encodeURIComponent(processId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function updateSession(
+  sessionId: string,
+  input: UpdateSessionInput,
+): Promise<Session> {
+  return readSession(
+    await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      body: JSON.stringify(input),
+      method: "PATCH",
+    }),
+  );
+}
+
+export async function updateSessionModel(
+  sessionId: string,
+  providerId: string,
+  modelId: string,
+  thinkingLevel: ThinkingLevelValue,
+): Promise<Session> {
+  return readSession(
+    await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
+      body: JSON.stringify({ modelId, providerId, thinkingLevel }),
+      method: "PATCH",
+    }),
+  );
+}
+
+export async function startSessionRun(
+  sessionId: string,
+  input: RunUserInput,
+  boardTaskId?: string,
+): Promise<RunAccepted> {
+  const body = (await (
+    await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/runs`, {
+      body: JSON.stringify({ ...input, ...(boardTaskId ? { boardTaskId } : {}) }),
+      method: "POST",
+    })
+  ).json()) as unknown;
+  if (!Value.Check(RunAcceptedSchema, body)) throw new Error("daemon 返回了无效的 Run 响应");
+  return body;
+}
+
+export async function retrySessionUserMessage(
+  sessionId: string,
+  messageEventId: string,
+  prompt: string,
+): Promise<RunAccepted> {
+  const body = (await (
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageEventId)}/retry`,
+      { body: JSON.stringify({ prompt }), method: "POST" },
+    )
+  ).json()) as unknown;
+  if (!Value.Check(RunAcceptedSchema, body)) throw new Error("daemon 返回了无效的 Run 响应");
+  return body;
+}
+
+export async function abortSessionRun(sessionId: string, runId: string): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function getSubAgentEvents(
+  sessionId: string,
+  executionId: string,
+  afterSeq = 0,
+  signal?: AbortSignal,
+): Promise<{ events: readonly HarnessEvent[]; hasMore: boolean }> {
+  const body: unknown = await (
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(executionId)}/events?afterSeq=${afterSeq}&limit=200`,
+      signal ? { signal } : undefined,
+    )
+  ).json();
+  if (!Value.Check(SubAgentEventsSchema, body)) throw new Error("daemon 返回了无效的子 Agent 事件");
+  return { events: body.events.map(parseEvent), hasMore: body.hasMore };
+}
+
+export async function abortSubAgent(sessionId: string, executionId: string): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(executionId)}/abort`,
+    { method: "POST" },
+  );
+}
+
+export async function followUpSessionRun(
+  sessionId: string,
+  runId: string,
+  input: RunUserInput,
+): Promise<QueuedRunInput> {
+  const body = (await (
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/follow-ups`,
+      { body: JSON.stringify(input), method: "POST" },
+    )
+  ).json()) as unknown;
+  if (!Value.Check(QueuedRunInputSchema, body)) {
+    throw new Error("daemon 返回了无效的排队消息");
+  }
+  return body;
+}
+
+export async function steerSessionRun(
+  sessionId: string,
+  runId: string,
+  input: RunUserInput,
+): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/steers`,
+    { body: JSON.stringify(input), method: "POST" },
+  );
+}
+
+export async function listQueuedSessionRunInputs(
+  sessionId: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<readonly QueuedRunInput[]> {
+  const body = (await (
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/follow-ups`,
+      signal ? { signal } : undefined,
+    )
+  ).json()) as unknown;
+  if (!Value.Check(QueuedRunInputListSchema, body)) {
+    throw new Error("daemon 返回了无效的排队消息列表");
+  }
+  return body;
+}
+
+export async function updateQueuedSessionRunInput(
+  sessionId: string,
+  runId: string,
+  queuedInputId: string,
+  prompt: string,
+): Promise<QueuedRunInput> {
+  const body = (await (
+    await apiRequest(
+      `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/follow-ups/${encodeURIComponent(queuedInputId)}`,
+      { body: JSON.stringify({ prompt }), method: "PATCH" },
+    )
+  ).json()) as unknown;
+  if (!Value.Check(QueuedRunInputSchema, body)) {
+    throw new Error("daemon 返回了无效的排队消息");
+  }
+  return body;
+}
+
+export async function removeQueuedSessionRunInput(
+  sessionId: string,
+  runId: string,
+  queuedInputId: string,
+): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/follow-ups/${encodeURIComponent(queuedInputId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function steerQueuedSessionRunInput(
+  sessionId: string,
+  runId: string,
+  queuedInputId: string,
+): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/follow-ups/${encodeURIComponent(queuedInputId)}/steer`,
+    { method: "POST" },
+  );
+}
+
+export async function revertSessionRunChanges(sessionId: string, runId: string): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/revert-changes`,
+    { method: "POST" },
+  );
+}
+
+export async function reapplySessionRunChanges(sessionId: string, runId: string): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/reapply-changes`,
+    { method: "POST" },
+  );
+}
+
+export async function restoreSessionContextCheckpoint(
+  sessionId: string,
+  eventSeq: number,
+): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/context-checkpoints/${eventSeq}/restore`,
+    { method: "POST" },
+  );
+}
+
+export async function resolveToolApproval(
+  sessionId: string,
+  runId: string,
+  approvalId: string,
+  decision: ApprovalResponseDecision,
+): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}`,
+    { body: JSON.stringify({ decision }), method: "POST" },
+  );
+}
+
+export async function resolveUserInput(
+  sessionId: string,
+  runId: string,
+  inputId: string,
+  submission: UserInputSubmission,
+): Promise<void> {
+  await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/inputs/${encodeURIComponent(inputId)}`,
+    { body: JSON.stringify(submission), method: "POST" },
+  );
+}
+
+export function parseSessionEvent(value: string): HarnessEvent {
+  return parseEvent(JSON.parse(value) as unknown);
+}
+
+export function sessionEventsUrl(sessionId: string, afterSeq: number, isTrace = false): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/events?afterSeq=${afterSeq}&conversation=${!isTrace}`;
+}
+
+const SessionFileChangesSchema = Type.Array(
+  Type.Object({
+    path: Type.String(),
+    status: Type.Union([Type.Literal("added"), Type.Literal("deleted"), Type.Literal("modified")]),
+    additions: Type.Optional(Type.Integer({ minimum: 0 })),
+    deletions: Type.Optional(Type.Integer({ minimum: 0 })),
+    before: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    after: Type.Optional(Type.String()),
+  }),
+);
+
+export async function getSessionRunFileChanges(
+  sessionId: string,
+  runId: string,
+  includeContent: boolean,
+  signal?: AbortSignal,
+) {
+  const response = await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/file-changes?includeContent=${includeContent}`,
+    signal ? { signal } : undefined,
+  );
+  const body: unknown = await response.json();
+  if (
+    !Value.Check(SessionFileChangesSchema, body) ||
+    (includeContent && body.some((file) => file.after === undefined || file.before === undefined))
+  ) {
+    throw new Error("daemon 返回了无效的文件变更");
+  }
+  return body;
+}
+
+export async function getSessionEvent(
+  sessionId: string,
+  eventSeq: number,
+  signal?: AbortSignal,
+): Promise<HarnessEvent> {
+  const response = await apiRequest(
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${eventSeq}`,
+    signal ? { signal } : undefined,
+  );
+  return parseEvent(await response.json());
+}

@@ -1,0 +1,32 @@
+name: Windows 11 installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: pnpm/action-setup@v4
+      - name: Select x64 Rust MSVC
+        run: rustup default stable-x86_64-pc-windows-msvc
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build NSIS installer
+        run: pnpm release:desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cwpi-windows-x64
+          path: |
+            apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe.sha256
+          if-no-files-found: error
+          compression-level: 0

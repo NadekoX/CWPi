@@ -1,0 +1,398 @@
+import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { createMemoryToolRegistrations, type MemoryRuntime } from "@cwpi/memory";
+import { type CommandPrefixRule, type SandboxCredential, ToolPermission } from "@cwpi/policy";
+import {
+  CommandProcessEventKind,
+  CommandProcessManager,
+  type CommandProcessSnapshot,
+  createSubAgentToolRegistrations,
+  createToolSearchTool,
+  createWorkspaceToolRegistry,
+  HybridToolSearch,
+  type PlanUpdatedData,
+  type SkillDefinition,
+  SkillRegistry,
+  type TodoUpdatedData,
+  type ToolRegistration,
+  type ToolSearchEmbedder,
+  type WorkspaceToolContext,
+} from "@cwpi/tools";
+import { loadWorkspaceAgentContext } from "./context/workspace-agent-context.js";
+import { createAgent } from "./create-agent.js";
+import type {
+  ContextCheckpointRecord,
+  ContextCompactedData,
+  RunContextData,
+  RunId,
+  SessionId,
+} from "./harness-event.js";
+import { HarnessEventType } from "./harness-event.js";
+import type { HumanInputRequester } from "./human-input.js";
+import { PLAN_MODE_SYSTEM_INSTRUCTION } from "./prompts/plan-mode-prompt.js";
+import { buildSystemPrompts } from "./prompts/system-prompt.js";
+import {
+  type HarnessEventListener,
+  type RestoreRunHistoryInput,
+  RunCoordinator,
+  type StartRunInput,
+} from "./run-coordinator.js";
+import type { ToolApprovalRequester } from "./tool-approval.js";
+import { type QueuedRunInput, RunMode, type RunUserInput } from "./user-input.js";
+
+export interface RestoreAgentInput {
+  contextCheckpoint: ContextCompactedData | null;
+  contextCheckpointEventSeq: number | null;
+  contextCheckpointHistory: readonly ContextCheckpointRecord[];
+  contextCheckpointTailStartMessageIndex: number | null;
+  initialSeq: number;
+  messages: readonly AgentMessage[];
+  model: Model<Api>;
+  plan: PlanUpdatedData | null;
+  sessionId: SessionId;
+  streamFn: StreamFn;
+  todos: TodoUpdatedData | null;
+  workspaceId: string;
+  workspaceRoot: string;
+}
+
+export type StartSessionRunInput = RestoreAgentInput &
+  Omit<StartRunInput, "contexts" | "systemPrompt">;
+
+export interface ExternalToolPreparationFailure {
+  displayName: string;
+  message: string;
+  source: string;
+}
+
+export interface PreparedExternalTools {
+  contexts?: readonly RunContextData[];
+  failures: readonly ExternalToolPreparationFailure[];
+  registrations: readonly ToolRegistration[];
+  release(): Promise<void> | void;
+}
+
+export type PrepareExternalTools = (
+  sessionId: string,
+  workspaceRoot: string,
+  signal: AbortSignal,
+) => Promise<PreparedExternalTools>;
+
+// Session 注册表
+// 核心：Map<SessionId, RunCoordinator>
+export class AgentManager {
+  private readonly runtimes = new Map<SessionId, RunCoordinator>();
+  private readonly commandProcesses = new Map<SessionId, CommandProcessManager>();
+  private readonly toolSearch: HybridToolSearch;
+  private activeSubAgents = 0;
+
+  public constructor(
+    private readonly onEvent: HarnessEventListener,
+    private readonly requestToolApproval: ToolApprovalRequester,
+    private readonly requestHumanInput: HumanInputRequester,
+    private readonly protectedPaths: readonly string[] = [],
+    private readonly globalRoot: string,
+    private readonly webSearchUrl: string,
+    private readonly skillGatewayUrl: string,
+    private readonly skillGatewayToken: string,
+    private readonly getRegisteredGlobalSkills: () => readonly SkillDefinition[] = () => [],
+    private readonly isSkillEnabled: (directory: string) => boolean = () => true,
+    private readonly getAllowedCommandPrefixes: () => readonly CommandPrefixRule[] = () => [],
+    private readonly getSandboxCredentials: () => readonly SandboxCredential[],
+    private readonly memory: MemoryRuntime,
+    private readonly prepareExternalTools?: PrepareExternalTools,
+    private readonly resolveSubAgentModel?: (
+      providerId: string,
+      modelId: string,
+    ) => Promise<Model<Api>>,
+    private readonly onCommandProcessError: (
+      error: unknown,
+      context: { processId: string; sessionId: string },
+    ) => void = () => undefined,
+    toolSearchEmbedder?: ToolSearchEmbedder,
+  ) {
+    this.toolSearch = new HybridToolSearch(toolSearchEmbedder);
+  }
+
+  private acquireSubAgentSlot = (): (() => void) | null => {
+    if (this.activeSubAgents >= 8) return null;
+    this.activeSubAgents += 1;
+    return () => {
+      this.activeSubAgents -= 1;
+    };
+  };
+
+  public isProviderActive(providerId: string): boolean {
+    return [...this.runtimes.values()].some((runtime) => runtime.activeProviderId === providerId);
+  }
+
+  public isSessionActive(sessionId: SessionId): boolean {
+    const runtime = this.runtimes.get(sessionId);
+    return runtime !== undefined && runtime.activeRunId !== null;
+  }
+
+  public async startRun(input: StartSessionRunInput): Promise<void> {
+    const [workspaceContext, memoryContext] = await Promise.all([
+      loadWorkspaceAgentContext({
+        getRegisteredGlobalSkills: this.getRegisteredGlobalSkills,
+        globalRoot: this.globalRoot,
+        isSkillEnabled: this.isSkillEnabled,
+        workspaceRoot: input.workspaceRoot,
+      }),
+      this.memory.buildContext(input.userInput.prompt, input.workspaceId),
+    ]);
+    const prompts = buildSystemPrompts(workspaceContext, input.workspaceRoot);
+    const preparedInput = {
+      ...input,
+      ...prompts,
+      contexts: [...prompts.contexts, { content: memoryContext, label: "Memory", type: "memory" }],
+      systemPrompt:
+        input.userInput.mode === RunMode.PLAN
+          ? `${prompts.systemPrompt}\n${PLAN_MODE_SYSTEM_INSTRUCTION}`
+          : prompts.systemPrompt,
+    };
+    const runtime = this.getOrCreate(preparedInput);
+    await runtime.start(preparedInput);
+  }
+
+  public abort(sessionId: SessionId, runId: RunId): boolean {
+    const aborted = this.runtimes.get(sessionId)?.abort(runId) ?? false;
+    if (aborted) {
+      void this.commandProcesses
+        .get(sessionId)
+        ?.stopRun(runId)
+        .catch((error: unknown) => {
+          this.onCommandProcessError(error, { processId: "run", sessionId });
+        });
+    }
+    return aborted;
+  }
+
+  public listCommandProcesses(sessionId: SessionId): readonly CommandProcessSnapshot[] {
+    return this.commandProcesses.get(sessionId)?.listActive() ?? [];
+  }
+
+  public stopCommandProcess(sessionId: SessionId, processId: string): Promise<boolean> {
+    return this.commandProcesses.get(sessionId)?.stop(processId) ?? Promise.resolve(false);
+  }
+
+  public async abortSubAgent(sessionId: SessionId, executionId: string): Promise<boolean> {
+    return (await this.runtimes.get(sessionId)?.abortSubAgent(executionId)) ?? false;
+  }
+
+  public async steer(sessionId: SessionId, runId: RunId, input: RunUserInput): Promise<boolean> {
+    return (await this.runtimes.get(sessionId)?.steer(runId, input)) ?? false;
+  }
+
+  public async followUp(
+    sessionId: SessionId,
+    runId: RunId,
+    input: RunUserInput,
+  ): Promise<QueuedRunInput | null> {
+    return (await this.runtimes.get(sessionId)?.followUp(runId, input)) ?? null;
+  }
+
+  public listQueuedFollowUps(sessionId: SessionId, runId: RunId): readonly QueuedRunInput[] {
+    return this.runtimes.get(sessionId)?.listQueuedFollowUps(runId) ?? [];
+  }
+
+  public async updateFollowUp(
+    sessionId: SessionId,
+    runId: RunId,
+    queuedInputId: string,
+    prompt: string,
+  ): Promise<QueuedRunInput | null> {
+    return (
+      (await this.runtimes.get(sessionId)?.updateFollowUp(runId, queuedInputId, prompt)) ?? null
+    );
+  }
+
+  public async removeFollowUp(
+    sessionId: SessionId,
+    runId: RunId,
+    queuedInputId: string,
+  ): Promise<boolean> {
+    return (await this.runtimes.get(sessionId)?.removeFollowUp(runId, queuedInputId)) ?? false;
+  }
+
+  public async steerFollowUp(
+    sessionId: SessionId,
+    runId: RunId,
+    queuedInputId: string,
+  ): Promise<boolean> {
+    return (await this.runtimes.get(sessionId)?.steerFollowUp(runId, queuedInputId)) ?? false;
+  }
+
+  public async close(): Promise<void> {
+    await Promise.all([...this.commandProcesses.values()].map((manager) => manager.close()));
+    const runtimes = [...this.runtimes.values()];
+    await Promise.all(runtimes.map((runtime) => runtime.close()));
+    this.commandProcesses.clear();
+    this.runtimes.clear();
+  }
+
+  public applyContextCheckpointRestore(sessionId: SessionId, eventSeq: number): boolean {
+    const runtime = this.runtimes.get(sessionId);
+    return runtime === undefined || runtime.applyContextCheckpointRestore(eventSeq);
+  }
+
+  public restoreHistory(sessionId: SessionId, input: RestoreRunHistoryInput): boolean {
+    const runtime = this.runtimes.get(sessionId);
+    return runtime === undefined || runtime.restoreHistory(input);
+  }
+
+  private getOrCreate(input: RestoreAgentInput & { systemPrompt: string }): RunCoordinator {
+    const current = this.runtimes.get(input.sessionId);
+    if (current !== undefined) return current;
+
+    const toolCapabilities = {
+      supportsImageInput: input.model.input.includes("image"),
+    };
+    let runtime: RunCoordinator | null = null;
+    const skillRegistry = new SkillRegistry({
+      workspaceRoot: input.workspaceRoot,
+      globalRoot: this.globalRoot,
+      getRegisteredGlobalSkills: this.getRegisteredGlobalSkills,
+      isSkillEnabled: this.isSkillEnabled,
+      skillGatewayUrl: this.skillGatewayUrl,
+    });
+    const subAgentTools = createSubAgentToolRegistrations({
+      spawn: (toolCallId, spawnInput, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.spawnSubAgent(toolCallId, spawnInput, signal);
+      },
+      wait: (waitInput, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.waitSubAgents(waitInput, signal);
+      },
+      send: (sendInput, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.sendSubAgentMessage(sendInput, signal);
+      },
+      stop: (stopInput, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.stopSubAgent(stopInput, signal);
+      },
+    });
+    const toolContext: WorkspaceToolContext = {
+      getRegisteredGlobalSkills: this.getRegisteredGlobalSkills,
+      getSandboxCredentials: this.getSandboxCredentials,
+      getActiveRunId: () => runtime?.activeRunId ?? null,
+      isFullAccess: () => runtime?.isFullAccess ?? false,
+      globalRoot: this.globalRoot,
+      isSkillEnabled: this.isSkillEnabled,
+      onPlanUpdated: (data) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.updatePlan(data);
+      },
+      onNetworkAccessRequested: (request, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.requestNetworkAccess(request, signal);
+      },
+      onCommandFileChangesDetected: (data) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        runtime.recordCommandFileChanges(data);
+      },
+      onHostExecutionRequested: (request, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.requestHostExecution(request, signal);
+      },
+      onContextCheckpointRestored: (steps) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.restoreContextCheckpoint(steps);
+      },
+      onSessionHistorySearched: (searchInput) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.searchSessionHistory(searchInput);
+      },
+      onTodosUpdated: (data) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.updateTodos(data);
+      },
+      onUserInputRequested: (data, signal) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.requestUserInput(data, signal);
+      },
+      onWorkingStateReset: (reason) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.resetWorkingState(reason);
+      },
+      protectedPaths: this.protectedPaths,
+      skillGatewayToken: this.skillGatewayToken,
+      skillGatewayUrl: this.skillGatewayUrl,
+      webSearchUrl: this.webSearchUrl,
+      supportsImageInput: () => toolCapabilities.supportsImageInput,
+      workspaceRoot: input.workspaceRoot,
+    };
+    const commandProcesses = new CommandProcessManager({
+      context: toolContext,
+      emitEvent: (kind, snapshot) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        const type =
+          kind === CommandProcessEventKind.STARTED
+            ? HarnessEventType.COMMAND_STARTED
+            : kind === CommandProcessEventKind.UPDATED
+              ? HarnessEventType.COMMAND_UPDATED
+              : HarnessEventType.COMMAND_EXITED;
+        return runtime.emitExternal({ data: snapshot, type }, snapshot.runId).then(() => undefined);
+      },
+      emitFileChanges: ({ changes, runId, toolCallId }) => {
+        if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+        return runtime.emitCommandFileChanges(runId, toolCallId, changes);
+      },
+      getSkillReadPaths: () => skillRegistry.getLoadedDirectories(),
+      onError: (error, processId) =>
+        this.onCommandProcessError(error, { processId, sessionId: input.sessionId }),
+      sessionId: input.sessionId,
+    });
+    toolContext.commandProcesses = commandProcesses;
+    const toolRegistry = createWorkspaceToolRegistry(toolContext, skillRegistry, [
+      ...createMemoryToolRegistrations(this.memory, input.sessionId, input.workspaceId),
+      ...subAgentTools,
+      {
+        policy: { permission: ToolPermission.READ_ONLY },
+        source: "built_in",
+        timeoutMs: 30_000,
+        tool: createToolSearchTool((query, limit, signal) => {
+          if (runtime === null) throw new Error("Session Runtime 尚未就绪");
+          return runtime.searchTools(query, limit, signal);
+        }),
+      },
+    ]);
+    const agent = createAgent({ ...input, tools: toolRegistry.tools });
+    runtime = new RunCoordinator(
+      input.sessionId,
+      agent,
+      toolRegistry,
+      input.initialSeq,
+      this.onEvent,
+      input.workspaceRoot,
+      this.protectedPaths,
+      this.requestToolApproval,
+      this.requestHumanInput,
+      (supportsImageInput) => {
+        toolCapabilities.supportsImageInput = supportsImageInput;
+      },
+      input.contextCheckpoint,
+      input.contextCheckpointEventSeq,
+      input.contextCheckpointTailStartMessageIndex,
+      [...input.contextCheckpointHistory],
+      input.plan,
+      input.todos,
+      this.getAllowedCommandPrefixes,
+      skillRegistry,
+      this.prepareExternalTools,
+      this.acquireSubAgentSlot,
+      (providerId, modelId) => {
+        if (this.resolveSubAgentModel === undefined)
+          throw new Error("SUBAGENT_MODEL_FAILED: 模型覆盖不可用");
+        return this.resolveSubAgentModel(providerId, modelId);
+      },
+      subAgentTools.map(({ tool }) => tool.name),
+      this.toolSearch,
+    );
+    this.commandProcesses.set(input.sessionId, commandProcesses);
+    this.runtimes.set(input.sessionId, runtime);
+    return runtime;
+  }
+}

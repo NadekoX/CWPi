@@ -1,0 +1,13 @@
+{
+  "apps": {
+    "computer-use": {
+      "displayName": "Computer Use",
+      "description": "Read and operate local Windows 11 app interfaces through Computer Use.",
+      "mcpServer": {
+        "type": "stdio",
+        "command": "pi-computer-use-helper",
+        "args": ["--mcp"]
+      }
+    }
+  }
+}

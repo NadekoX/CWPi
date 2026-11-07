@@ -1,0 +1,210 @@
+import { UserInputResponseAction } from "@cwpi/agent-runtime";
+import { ApprovalDecision } from "@cwpi/agent-runtime/harness-event";
+import { ThinkingLevel } from "@cwpi/agent-runtime/thinking-level";
+import { RunMode, UserContextReferenceKind } from "@cwpi/agent-runtime/user-input";
+import { type Static, Type } from "typebox";
+
+const IdentifierSchema = Type.String({ maxLength: 256, minLength: 1 });
+const ThinkingLevelSchema = Type.Union([
+  Type.Literal(ThinkingLevel.OFF),
+  Type.Literal(ThinkingLevel.MINIMAL),
+  Type.Literal(ThinkingLevel.LOW),
+  Type.Literal(ThinkingLevel.MEDIUM),
+  Type.Literal(ThinkingLevel.HIGH),
+  Type.Literal(ThinkingLevel.XHIGH),
+  Type.Literal(ThinkingLevel.MAX),
+]);
+
+export const SessionParamsDtoSchema = Type.Object({
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionParamsDto = Static<typeof SessionParamsDtoSchema>;
+
+export const SessionCommandParamsDtoSchema = Type.Object({
+  processId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionCommandParamsDto = Static<typeof SessionCommandParamsDtoSchema>;
+
+export const SessionCheckpointParamsDtoSchema = Type.Object({
+  eventSeq: Type.Integer({ minimum: 1 }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionCheckpointParamsDto = Static<typeof SessionCheckpointParamsDtoSchema>;
+
+export const SessionListQueryDtoSchema = Type.Object({
+  archived: Type.Optional(Type.Boolean()),
+});
+
+export type SessionListQueryDto = Static<typeof SessionListQueryDtoSchema>;
+
+export const SessionSearchQueryDtoSchema = Type.Object({
+  query: Type.Optional(Type.String({ maxLength: 500 })),
+});
+
+export type SessionSearchQueryDto = Static<typeof SessionSearchQueryDtoSchema>;
+
+export const SessionRunParamsDtoSchema = Type.Object({
+  runId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionRunParamsDto = Static<typeof SessionRunParamsDtoSchema>;
+
+export const SessionSubAgentParamsDtoSchema = Type.Object({
+  executionId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+export type SessionSubAgentParamsDto = Static<typeof SessionSubAgentParamsDtoSchema>;
+
+export const SessionSubAgentEventsQueryDtoSchema = Type.Object({
+  afterSeq: Type.Optional(Type.Integer({ minimum: 0 })),
+  limit: Type.Optional(Type.Integer({ maximum: 200, minimum: 1 })),
+});
+export type SessionSubAgentEventsQueryDto = Static<typeof SessionSubAgentEventsQueryDtoSchema>;
+
+export const SessionQueuedInputParamsDtoSchema = Type.Object({
+  queuedInputId: Type.String({ format: "uuid" }),
+  runId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionQueuedInputParamsDto = Static<typeof SessionQueuedInputParamsDtoSchema>;
+
+export const SessionMessageParamsDtoSchema = Type.Object({
+  messageEventId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionMessageParamsDto = Static<typeof SessionMessageParamsDtoSchema>;
+
+export const SessionApprovalParamsDtoSchema = Type.Object({
+  approvalId: Type.String({ format: "uuid" }),
+  runId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionApprovalParamsDto = Static<typeof SessionApprovalParamsDtoSchema>;
+
+export const SessionInputParamsDtoSchema = Type.Object({
+  inputId: Type.String({ format: "uuid" }),
+  runId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type SessionInputParamsDto = Static<typeof SessionInputParamsDtoSchema>;
+
+export const ResolveApprovalDtoSchema = Type.Object({
+  decision: Type.Union([
+    Type.Literal(ApprovalDecision.APPROVED),
+    Type.Literal(ApprovalDecision.APPROVED_SESSION),
+    Type.Literal(ApprovalDecision.APPROVED_SIMILAR),
+    Type.Literal(ApprovalDecision.REJECTED),
+  ]),
+});
+
+export type ResolveApprovalDto = Static<typeof ResolveApprovalDtoSchema>;
+
+export const ResolveInputDtoSchema = Type.Object({
+  action: Type.Union([
+    Type.Literal(UserInputResponseAction.SUBMIT),
+    Type.Literal(UserInputResponseAction.CONFIRM_PLAN),
+  ]),
+  answers: Type.Array(
+    Type.Object({
+      questionId: Type.String({ minLength: 1 }),
+      selectedOption: Type.Optional(Type.String({ minLength: 1 })),
+      selectedOptions: Type.Optional(
+        Type.Array(Type.String({ minLength: 1 }), {
+          minItems: 1,
+          uniqueItems: true,
+        }),
+      ),
+      value: Type.String({ minLength: 1 }),
+    }),
+    { minItems: 1 },
+  ),
+});
+
+export type ResolveInputDto = Static<typeof ResolveInputDtoSchema>;
+
+export const CreateSessionDtoSchema = Type.Object({
+  modelId: IdentifierSchema,
+  providerId: IdentifierSchema,
+  thinkingLevel: Type.Optional(ThinkingLevelSchema),
+  title: Type.Optional(Type.String({ maxLength: 200 })),
+  workspaceId: Type.String({ format: "uuid" }),
+});
+
+export type CreateSessionDto = Static<typeof CreateSessionDtoSchema>;
+
+export const UpdateSessionDtoSchema = Type.Object(
+  {
+    archived: Type.Optional(Type.Boolean()),
+    title: Type.Optional(Type.String({ maxLength: 200, minLength: 1 })),
+  },
+  { minProperties: 1 },
+);
+
+export type UpdateSessionDto = Static<typeof UpdateSessionDtoSchema>;
+
+export const UpdateSessionModelDtoSchema = Type.Object({
+  modelId: IdentifierSchema,
+  providerId: IdentifierSchema,
+  thinkingLevel: Type.Optional(ThinkingLevelSchema),
+});
+
+export type UpdateSessionModelDto = Static<typeof UpdateSessionModelDtoSchema>;
+
+const RunInputAttachmentSchema = Type.Object({
+  data: Type.String({ maxLength: 7_000_000 }),
+  mimeType: Type.String({ maxLength: 255, minLength: 1 }),
+  name: Type.String({ maxLength: 255, minLength: 1 }),
+  size: Type.Integer({ maximum: 5 * 1024 * 1024, minimum: 0 }),
+});
+
+const RunInputContextReferenceSchema = Type.Object({
+  kind: Type.Union([
+    Type.Literal(UserContextReferenceKind.FILE),
+    Type.Literal(UserContextReferenceKind.FOLDER),
+    Type.Literal(UserContextReferenceKind.IMAGE),
+  ]),
+  path: Type.String({ maxLength: 4_096, minLength: 1 }),
+});
+
+export const StartRunDtoSchema = Type.Object({
+  attachments: Type.Optional(Type.Array(RunInputAttachmentSchema, { maxItems: 8 })),
+  boardTaskId: Type.Optional(Type.String({ format: "uuid" })),
+  mode: Type.Optional(Type.Union([Type.Literal(RunMode.DEFAULT), Type.Literal(RunMode.PLAN)])),
+  prompt: Type.String({ maxLength: 1_000_000 }),
+  references: Type.Optional(Type.Array(RunInputContextReferenceSchema, { maxItems: 32 })),
+});
+
+export type StartRunDto = Static<typeof StartRunDtoSchema>;
+
+export const UpdateQueuedInputDtoSchema = Type.Object({
+  prompt: Type.String({ maxLength: 1_000_000, minLength: 1 }),
+});
+
+export type UpdateQueuedInputDto = Static<typeof UpdateQueuedInputDtoSchema>;
+
+export const RetryUserMessageDtoSchema = Type.Object({
+  prompt: Type.String({ maxLength: 1_000_000, minLength: 1 }),
+});
+
+export type RetryUserMessageDto = Static<typeof RetryUserMessageDtoSchema>;
+
+export const SessionEventsQueryDtoSchema = Type.Object({
+  conversation: Type.Optional(Type.Boolean()),
+  afterSeq: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+export type SessionEventsQueryDto = Static<typeof SessionEventsQueryDtoSchema>;
+
+export const SessionFileChangesQueryDtoSchema = Type.Object({
+  includeContent: Type.Optional(Type.Boolean()),
+});
+export type SessionFileChangesQueryDto = Static<typeof SessionFileChangesQueryDtoSchema>;

@@ -1,0 +1,1048 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import {
+  isOutputDetail,
+  isReasoningSummary,
+  OutputDetail,
+  type OutputDetail as OutputDetailValue,
+  ReasoningSummary,
+  type ReasoningSummary as ReasoningSummaryValue,
+} from "@cwpi/agent-runtime/model-response-preferences";
+import { isThinkingLevel, type ThinkingLevel } from "@cwpi/agent-runtime/thinking-level";
+import {
+  BusySubmitBehavior,
+  type BusySubmitBehavior as BusySubmitBehaviorValue,
+  isBusySubmitBehavior,
+} from "@cwpi/agent-runtime/user-input";
+import { ApprovalPolicy, type ApprovalPolicyValue, isApprovalPolicy } from "@cwpi/policy";
+import { isPlainObject } from "es-toolkit";
+import { FileOpenMode, type FileOpenMode as FileOpenModeValue } from "../schemas/file-open.js";
+import { type BoardTaskRepository, SqliteBoardTaskRepository } from "./board-task-repository.js";
+import { type McpServerRepository, SqliteMcpServerRepository } from "./mcp-server-repository.js";
+import { SqliteMemoryRepository } from "./memory-repository.js";
+import { DATABASE_MIGRATIONS } from "./migrations.js";
+
+export const DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW = 128_000;
+export const DEFAULT_CUSTOM_MODEL_MAX_TOKENS = 32_000;
+
+export interface CustomProviderModelRecord {
+  contextWindow: number;
+  id: string;
+  maxTokens: number;
+  reasoning: boolean;
+}
+
+export interface CustomProviderRecord {
+  baseUrl: string;
+  createdAt: number;
+  enabled: boolean;
+  id: string;
+  models: readonly CustomProviderModelRecord[];
+  name: string;
+  protocol: string;
+  requiresApiKey: boolean;
+  updatedAt: number;
+}
+
+export interface ProviderSettingRepository {
+  createCustom(provider: CustomProviderRecord): void;
+  deleteCustom(providerId: string): boolean;
+  findCustom(providerId: string): CustomProviderRecord | null;
+  listBuiltInEnabled(): ReadonlyMap<string, boolean>;
+  listCustom(): readonly CustomProviderRecord[];
+  setBuiltInEnabled(providerId: string, enabled: boolean, updatedAt: number): void;
+  updateCustom(provider: CustomProviderRecord): boolean;
+}
+
+export interface ComputerUseAllowedApp {
+  bundleId: string;
+  name: string;
+}
+
+export interface AppSettingRepository {
+  getApprovalPolicy(): ApprovalPolicyValue;
+  getBusySubmitBehavior(): BusySubmitBehaviorValue;
+  isSubAgentEnabled(): boolean;
+  getDefaultModel(): DefaultModelSetting | null;
+  getDisabledSkillCollectionSkillIds(): readonly string[];
+  getDisabledSkillDirectories(): readonly string[];
+  getInstalledSkillCollectionIds(): readonly string[];
+  getFileOpenApplication(): FileOpenApplicationSetting | null;
+  getFileOpenMode(): FileOpenModeValue;
+  getOutputDetail(): OutputDetailValue;
+  getReasoningSummary(): ReasoningSummaryValue;
+  getComputerUseAllowedApps(): ComputerUseAllowedApp[];
+  isComputerUseAppAllowed(bundleId: string): boolean;
+  grantComputerUseApp(app: ComputerUseAllowedApp, updatedAt: number): void;
+  revokeComputerUseApp(bundleId: string): boolean;
+  setApprovalPolicy(approvalPolicy: ApprovalPolicyValue, updatedAt: number): void;
+  setBusySubmitBehavior(behavior: BusySubmitBehaviorValue, updatedAt: number): void;
+  setSubAgentEnabled(enabled: boolean, updatedAt: number): void;
+  setDefaultModel(defaultModel: DefaultModelSetting, updatedAt: number): void;
+  setDisabledSkillCollectionSkillIds(skillIds: readonly string[], updatedAt: number): void;
+  setDisabledSkillDirectories(directories: readonly string[], updatedAt: number): void;
+  setInstalledSkillCollectionIds(collectionIds: readonly string[], updatedAt: number): void;
+  setFileOpenApplication(application: FileOpenApplicationSetting, updatedAt: number): void;
+  setFileOpenMode(mode: FileOpenModeValue, updatedAt: number): void;
+  setOutputDetail(outputDetail: OutputDetailValue, updatedAt: number): void;
+  setReasoningSummary(reasoningSummary: ReasoningSummaryValue, updatedAt: number): void;
+}
+
+export interface DefaultModelSetting {
+  modelId: string;
+  providerId: string;
+  thinkingLevel: ThinkingLevel;
+}
+
+export interface FileOpenApplicationSetting {
+  iconDataUrl: string | null;
+  name: string;
+  path: string;
+}
+
+export interface SessionRecord {
+  createdAt: number;
+  id: string;
+  lastSeq: number;
+  modelId: string;
+  providerId: string;
+  thinkingLevel: ThinkingLevel;
+  title: string;
+  updatedAt: number;
+  workspaceId: string;
+  workspaceRoot: string;
+}
+
+export interface WorkspaceRecord {
+  createdAt: number;
+  id: string;
+  name: string | null;
+  removedAt: number | null;
+  rootPath: string;
+  updatedAt: number;
+}
+
+export interface CreateSessionRecord {
+  createdAt: number;
+  id: string;
+  modelId: string;
+  providerId: string;
+  thinkingLevel: ThinkingLevel;
+  title: string;
+  workspaceId: string;
+}
+
+export interface SessionSearchDocumentRecord {
+  description: string;
+  sessionId: string;
+  sourceSize: number;
+}
+
+export interface SessionSearchMessageInput {
+  eventId: string;
+  messageIndex: number;
+  normalizedText: string;
+  text: string;
+}
+
+export interface SessionSearchMessageMatch {
+  eventId: string;
+  sessionId: string;
+  text: string;
+}
+
+export interface SessionRepository {
+  create(session: CreateSessionRecord): SessionRecord;
+  find(sessionId: string): SessionRecord | null;
+  list(archived?: boolean): readonly SessionRecord[];
+  listIds(): readonly string[];
+  listSearchDocuments(): readonly SessionSearchDocumentRecord[];
+  replaceSearchDocument(
+    sessionId: string,
+    sourceSize: number,
+    description: string,
+    messages: readonly SessionSearchMessageInput[],
+  ): void;
+  searchMessages(normalizedQuery: string): readonly SessionSearchMessageMatch[];
+  setArchived(sessionId: string, archivedAt: number | null, updatedAt: number): boolean;
+  updateIndex(sessionId: string, lastSeq: number, updatedAt: number): boolean;
+  updateModel(
+    sessionId: string,
+    providerId: string,
+    modelId: string,
+    thinkingLevel: ThinkingLevel | undefined,
+    updatedAt: number,
+  ): boolean;
+  updateTitle(sessionId: string, title: string, updatedAt: number): boolean;
+}
+
+export interface WorkspaceRepository {
+  create(rootPath: string, createdAt: number): WorkspaceRecord;
+  find(workspaceId: string): WorkspaceRecord | null;
+  list(): readonly WorkspaceRecord[];
+  remove(workspaceId: string, removedAt: number): boolean;
+  reorder(workspaceIds: readonly string[], updatedAt: number): void;
+  updateName(workspaceId: string, name: string, updatedAt: number): WorkspaceRecord | null;
+}
+
+interface DatabaseRow {
+  [key: string]: unknown;
+}
+
+function readRequiredString(row: DatabaseRow, key: string): string {
+  const value = row[key];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Invalid database value for ${key}`);
+  }
+  return value;
+}
+
+function readNullableString(row: DatabaseRow, key: string): string | null {
+  const value = row[key];
+  if (value !== null && typeof value !== "string") {
+    throw new Error(`Invalid database value for ${key}`);
+  }
+  return value;
+}
+
+function readRequiredNumber(row: DatabaseRow, key: string): number {
+  const value = row[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error(`Invalid database value for ${key}`);
+  }
+  return value;
+}
+
+function readNullableNumber(row: DatabaseRow, key: string): number | null {
+  const value = row[key];
+  if (value !== null && (typeof value !== "number" || !Number.isSafeInteger(value))) {
+    throw new Error(`Invalid database value for ${key}`);
+  }
+  return value;
+}
+
+function mapCustomProvider(row: DatabaseRow): CustomProviderRecord {
+  const storedModels = JSON.parse(readRequiredString(row, "model_ids_json")) as unknown;
+  if (!Array.isArray(storedModels)) {
+    throw new Error("Invalid database value for model_ids_json");
+  }
+  const models = storedModels.map((value): CustomProviderModelRecord => {
+    if (typeof value === "string") {
+      return {
+        contextWindow: DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW,
+        id: value,
+        maxTokens: DEFAULT_CUSTOM_MODEL_MAX_TOKENS,
+        reasoning: false,
+      };
+    }
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !("id" in value) ||
+      !("contextWindow" in value) ||
+      !("maxTokens" in value) ||
+      typeof value.id !== "string" ||
+      ("reasoning" in value && typeof value.reasoning !== "boolean") ||
+      !Number.isSafeInteger(value.contextWindow) ||
+      !Number.isSafeInteger(value.maxTokens) ||
+      value.contextWindow < 1_024 ||
+      value.maxTokens < 1 ||
+      value.maxTokens > value.contextWindow
+    ) {
+      throw new Error("Invalid database value for model_ids_json");
+    }
+    return {
+      contextWindow: value.contextWindow as number,
+      id: value.id,
+      maxTokens: value.maxTokens as number,
+      reasoning: "reasoning" in value ? (value.reasoning as boolean) : false,
+    };
+  });
+
+  return {
+    baseUrl: readRequiredString(row, "base_url"),
+    createdAt: Number(row.created_at),
+    enabled: row.enabled === 1,
+    id: readRequiredString(row, "provider_id"),
+    models,
+    name: readRequiredString(row, "name"),
+    protocol: readRequiredString(row, "protocol"),
+    requiresApiKey: row.requires_api_key === 1,
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+function mapSession(row: DatabaseRow): SessionRecord {
+  const thinkingLevel = readRequiredString(row, "thinking_level");
+  if (!isThinkingLevel(thinkingLevel)) {
+    throw new Error("Invalid database value for thinking_level");
+  }
+  return {
+    createdAt: readRequiredNumber(row, "created_at"),
+    id: readRequiredString(row, "id"),
+    lastSeq: readRequiredNumber(row, "last_seq"),
+    modelId: readRequiredString(row, "model_id"),
+    providerId: readRequiredString(row, "provider_id"),
+    thinkingLevel,
+    title: readRequiredString(row, "title"),
+    updatedAt: readRequiredNumber(row, "updated_at"),
+    workspaceId: readRequiredString(row, "workspace_id"),
+    workspaceRoot: readRequiredString(row, "workspace_root"),
+  };
+}
+
+function mapWorkspace(row: DatabaseRow): WorkspaceRecord {
+  return {
+    createdAt: readRequiredNumber(row, "created_at"),
+    id: readRequiredString(row, "id"),
+    name: readNullableString(row, "display_name"),
+    removedAt: readNullableNumber(row, "removed_at"),
+    rootPath: readRequiredString(row, "root_path"),
+    updatedAt: readRequiredNumber(row, "updated_at"),
+  };
+}
+
+function runMigrations(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT;
+  `);
+
+  const hasMigration = database.prepare("SELECT 1 FROM schema_migrations WHERE version = ?");
+  const recordMigration = database.prepare(
+    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+  );
+
+  for (const migration of DATABASE_MIGRATIONS) {
+    if (hasMigration.get(migration.version) !== undefined) {
+      continue;
+    }
+
+    // migration 与版本记录在同一事务中提交。失败后可在 daemon 下次启动时安全重试，
+    // 避免数据库结构停留在只完成一部分的状态。
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      if ("sql" in migration) {
+        database.exec(migration.sql);
+      } else {
+        migration.migrate(database);
+      }
+      recordMigration.run(migration.version, Date.now());
+      database.exec("COMMIT");
+    } catch (error: unknown) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+}
+
+class SqliteProviderSettingRepository implements ProviderSettingRepository {
+  public constructor(private readonly database: DatabaseSync) {}
+
+  public createCustom(provider: CustomProviderRecord): void {
+    this.database
+      .prepare(
+        `INSERT INTO provider_settings (
+           provider_id, kind, name, protocol, base_url, model_ids_json,
+           requires_api_key, enabled, created_at, updated_at
+         ) VALUES (?, 'custom', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        provider.id,
+        provider.name,
+        provider.protocol,
+        provider.baseUrl,
+        JSON.stringify(provider.models),
+        Number(provider.requiresApiKey),
+        Number(provider.enabled),
+        provider.createdAt,
+        provider.updatedAt,
+      );
+  }
+
+  public deleteCustom(providerId: string): boolean {
+    return (
+      this.database
+        .prepare("DELETE FROM provider_settings WHERE provider_id = ? AND kind = 'custom'")
+        .run(providerId).changes > 0
+    );
+  }
+
+  public findCustom(providerId: string): CustomProviderRecord | null {
+    const row = this.database
+      .prepare("SELECT * FROM provider_settings WHERE provider_id = ? AND kind = 'custom'")
+      .get(providerId) as DatabaseRow | undefined;
+    return row ? mapCustomProvider(row) : null;
+  }
+
+  public listBuiltInEnabled(): ReadonlyMap<string, boolean> {
+    const rows = this.database
+      .prepare("SELECT provider_id, enabled FROM provider_settings WHERE kind = 'builtin'")
+      .all() as DatabaseRow[];
+    return new Map(rows.map((row) => [readRequiredString(row, "provider_id"), row.enabled === 1]));
+  }
+
+  public listCustom(): readonly CustomProviderRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM provider_settings WHERE kind = 'custom' ORDER BY created_at")
+      .all() as DatabaseRow[];
+    return rows.map(mapCustomProvider);
+  }
+
+  public setBuiltInEnabled(providerId: string, enabled: boolean, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO provider_settings (
+           provider_id, kind, model_ids_json, requires_api_key, enabled, created_at, updated_at
+         ) VALUES (?, 'builtin', '[]', 1, ?, ?, ?)
+         ON CONFLICT(provider_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`,
+      )
+      .run(providerId, Number(enabled), updatedAt, updatedAt);
+  }
+
+  public updateCustom(provider: CustomProviderRecord): boolean {
+    return (
+      this.database
+        .prepare(
+          `UPDATE provider_settings SET
+             name = ?, protocol = ?, base_url = ?, model_ids_json = ?,
+             requires_api_key = ?, enabled = ?, updated_at = ?
+           WHERE provider_id = ? AND kind = 'custom'`,
+        )
+        .run(
+          provider.name,
+          provider.protocol,
+          provider.baseUrl,
+          JSON.stringify(provider.models),
+          Number(provider.requiresApiKey),
+          Number(provider.enabled),
+          provider.updatedAt,
+          provider.id,
+        ).changes > 0
+    );
+  }
+}
+
+const APPROVAL_POLICY_KEY = "approval_policy";
+const BUSY_SUBMIT_BEHAVIOR_KEY = "busy_submit_behavior";
+const SUB_AGENT_ENABLED_KEY = "sub_agent_enabled";
+const DEFAULT_MODEL_KEY = "default_model";
+const DISABLED_SKILL_COLLECTION_SKILLS_KEY = "disabled_skill_collection_skills";
+const DISABLED_SKILL_DIRECTORIES_KEY = "disabled_skill_directories";
+const INSTALLED_SKILL_COLLECTIONS_KEY = "installed_skill_collections";
+const FILE_OPEN_APPLICATION_KEY = "file_open_application";
+const FILE_OPEN_MODE_KEY = "file_open_mode";
+const OUTPUT_DETAIL_KEY = "output_detail";
+const REASONING_SUMMARY_KEY = "reasoning_summary";
+const COMPUTER_USE_ALLOWED_APP_PREFIX = "computer_use_allowed_app:";
+
+class SqliteAppSettingRepository implements AppSettingRepository {
+  public constructor(private readonly database: DatabaseSync) {}
+
+  public getApprovalPolicy(): ApprovalPolicyValue {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(APPROVAL_POLICY_KEY) as DatabaseRow | undefined;
+    if (!row) return ApprovalPolicy.REQUEST_APPROVAL;
+
+    const value = readRequiredString(row, "value");
+    if (!isApprovalPolicy(value)) {
+      throw new Error("Invalid database value for approval policy");
+    }
+    return value;
+  }
+
+  public getBusySubmitBehavior(): BusySubmitBehaviorValue {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(BUSY_SUBMIT_BEHAVIOR_KEY) as DatabaseRow | undefined;
+    if (!row) return BusySubmitBehavior.QUEUE;
+
+    const value = readRequiredString(row, "value");
+    if (!isBusySubmitBehavior(value)) {
+      throw new Error("Invalid database value for busy submit behavior");
+    }
+    return value;
+  }
+
+  public isSubAgentEnabled(): boolean {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(SUB_AGENT_ENABLED_KEY) as DatabaseRow | undefined;
+    if (!row) return true;
+    const value = readRequiredString(row, "value");
+    if (value !== "true" && value !== "false") {
+      throw new Error("Invalid database value for sub agent enabled");
+    }
+    return value === "true";
+  }
+
+  public getDefaultModel(): DefaultModelSetting | null {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(DEFAULT_MODEL_KEY) as DatabaseRow | undefined;
+    if (!row) return null;
+
+    const value = JSON.parse(readRequiredString(row, "value")) as unknown;
+    if (
+      !isPlainObject(value) ||
+      typeof value.providerId !== "string" ||
+      value.providerId.length === 0 ||
+      typeof value.modelId !== "string" ||
+      value.modelId.length === 0 ||
+      !isThinkingLevel(value.thinkingLevel)
+    ) {
+      throw new Error("Invalid database value for default model");
+    }
+    return {
+      modelId: value.modelId,
+      providerId: value.providerId,
+      thinkingLevel: value.thinkingLevel,
+    };
+  }
+
+  public getDisabledSkillDirectories(): readonly string[] {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(DISABLED_SKILL_DIRECTORIES_KEY) as DatabaseRow | undefined;
+    if (!row) return [];
+
+    const value = JSON.parse(readRequiredString(row, "value")) as unknown;
+    if (!Array.isArray(value) || !value.every((directory) => typeof directory === "string")) {
+      throw new Error("Invalid database value for disabled skill directories");
+    }
+    return value;
+  }
+
+  public getDisabledSkillCollectionSkillIds(): readonly string[] {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(DISABLED_SKILL_COLLECTION_SKILLS_KEY) as DatabaseRow | undefined;
+    if (!row) return [];
+
+    const value = JSON.parse(readRequiredString(row, "value")) as unknown;
+    if (!Array.isArray(value) || !value.every((skillId) => typeof skillId === "string")) {
+      throw new Error("Invalid database value for disabled Skill collection skills");
+    }
+    return value;
+  }
+
+  public getInstalledSkillCollectionIds(): readonly string[] {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(INSTALLED_SKILL_COLLECTIONS_KEY) as DatabaseRow | undefined;
+    if (!row) return [];
+
+    const value = JSON.parse(readRequiredString(row, "value")) as unknown;
+    if (!Array.isArray(value) || !value.every((collectionId) => typeof collectionId === "string")) {
+      throw new Error("Invalid database value for installed Skill collections");
+    }
+    return value;
+  }
+
+  public getFileOpenApplication(): FileOpenApplicationSetting | null {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(FILE_OPEN_APPLICATION_KEY) as DatabaseRow | undefined;
+    if (!row) return null;
+
+    const value = JSON.parse(readRequiredString(row, "value")) as unknown;
+    if (
+      !isPlainObject(value) ||
+      typeof value.name !== "string" ||
+      value.name.length === 0 ||
+      typeof value.path !== "string" ||
+      value.path.length === 0 ||
+      (value.iconDataUrl !== null && typeof value.iconDataUrl !== "string")
+    ) {
+      throw new Error("Invalid database value for file open application");
+    }
+    return {
+      iconDataUrl: value.iconDataUrl,
+      name: value.name,
+      path: value.path,
+    };
+  }
+
+  public getFileOpenMode(): FileOpenModeValue {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(FILE_OPEN_MODE_KEY) as DatabaseRow | undefined;
+    if (!row) return FileOpenMode.ASK;
+
+    const value = readRequiredString(row, "value");
+    if (value !== FileOpenMode.ALWAYS && value !== FileOpenMode.ASK) {
+      throw new Error("Invalid database value for file open mode");
+    }
+    return value;
+  }
+
+  public getOutputDetail(): OutputDetailValue {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(OUTPUT_DETAIL_KEY) as DatabaseRow | undefined;
+    if (!row) return OutputDetail.MODEL_DEFAULT;
+
+    const value = readRequiredString(row, "value");
+    if (!isOutputDetail(value)) throw new Error("Invalid database value for output detail");
+    return value;
+  }
+
+  public getReasoningSummary(): ReasoningSummaryValue {
+    const row = this.database
+      .prepare("SELECT value FROM app_settings WHERE key = ?")
+      .get(REASONING_SUMMARY_KEY) as DatabaseRow | undefined;
+    if (!row) return ReasoningSummary.AUTO;
+
+    const value = readRequiredString(row, "value");
+    if (!isReasoningSummary(value)) {
+      throw new Error("Invalid database value for reasoning summary");
+    }
+    return value;
+  }
+
+  public getComputerUseAllowedApps(): ComputerUseAllowedApp[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT key, value FROM app_settings WHERE key LIKE ? ORDER BY value COLLATE NOCASE",
+        )
+        .all(`${COMPUTER_USE_ALLOWED_APP_PREFIX}%`) as DatabaseRow[]
+    ).map((row) => ({
+      bundleId: readRequiredString(row, "key").slice(COMPUTER_USE_ALLOWED_APP_PREFIX.length),
+      name: readRequiredString(row, "value"),
+    }));
+  }
+
+  public isComputerUseAppAllowed(bundleId: string): boolean {
+    return (
+      this.database
+        .prepare("SELECT 1 FROM app_settings WHERE key = ?")
+        .get(`${COMPUTER_USE_ALLOWED_APP_PREFIX}${bundleId}`) !== undefined
+    );
+  }
+
+  public grantComputerUseApp(app: ComputerUseAllowedApp, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(`${COMPUTER_USE_ALLOWED_APP_PREFIX}${app.bundleId}`, app.name, updatedAt);
+  }
+
+  public revokeComputerUseApp(bundleId: string): boolean {
+    return (
+      this.database
+        .prepare("DELETE FROM app_settings WHERE key = ?")
+        .run(`${COMPUTER_USE_ALLOWED_APP_PREFIX}${bundleId}`).changes > 0
+    );
+  }
+
+  public setApprovalPolicy(approvalPolicy: ApprovalPolicyValue, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(APPROVAL_POLICY_KEY, approvalPolicy, updatedAt);
+  }
+
+  public setBusySubmitBehavior(behavior: BusySubmitBehaviorValue, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(BUSY_SUBMIT_BEHAVIOR_KEY, behavior, updatedAt);
+  }
+
+  public setSubAgentEnabled(enabled: boolean, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(SUB_AGENT_ENABLED_KEY, String(enabled), updatedAt);
+  }
+
+  public setDefaultModel(defaultModel: DefaultModelSetting, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(DEFAULT_MODEL_KEY, JSON.stringify(defaultModel), updatedAt);
+  }
+
+  public setDisabledSkillDirectories(directories: readonly string[], updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(DISABLED_SKILL_DIRECTORIES_KEY, JSON.stringify(directories), updatedAt);
+  }
+
+  public setDisabledSkillCollectionSkillIds(skillIds: readonly string[], updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(DISABLED_SKILL_COLLECTION_SKILLS_KEY, JSON.stringify(skillIds), updatedAt);
+  }
+
+  public setInstalledSkillCollectionIds(collectionIds: readonly string[], updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(INSTALLED_SKILL_COLLECTIONS_KEY, JSON.stringify(collectionIds), updatedAt);
+  }
+
+  public setFileOpenApplication(application: FileOpenApplicationSetting, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(FILE_OPEN_APPLICATION_KEY, JSON.stringify(application), updatedAt);
+  }
+
+  public setFileOpenMode(mode: FileOpenModeValue, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(FILE_OPEN_MODE_KEY, mode, updatedAt);
+  }
+
+  public setOutputDetail(outputDetail: OutputDetailValue, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(OUTPUT_DETAIL_KEY, outputDetail, updatedAt);
+  }
+
+  public setReasoningSummary(reasoningSummary: ReasoningSummaryValue, updatedAt: number): void {
+    this.database
+      .prepare(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(REASONING_SUMMARY_KEY, reasoningSummary, updatedAt);
+  }
+}
+
+class SqliteSessionRepository implements SessionRepository {
+  public constructor(private readonly database: DatabaseSync) {}
+
+  public create(session: CreateSessionRecord): SessionRecord {
+    this.database
+      .prepare(
+        `INSERT INTO sessions (
+           id, workspace_id, provider_id, model_id, thinking_level, title, last_seq,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      )
+      .run(
+        session.id,
+        session.workspaceId,
+        session.providerId,
+        session.modelId,
+        session.thinkingLevel,
+        session.title,
+        session.createdAt,
+        session.createdAt,
+      );
+    const created = this.find(session.id);
+    if (!created) throw new Error("Created session could not be read");
+    return created;
+  }
+
+  public find(sessionId: string): SessionRecord | null {
+    const row = this.database
+      .prepare(
+        `SELECT sessions.*, workspaces.root_path AS workspace_root
+         FROM sessions
+         INNER JOIN workspaces ON workspaces.id = sessions.workspace_id
+         WHERE sessions.id = ?`,
+      )
+      .get(sessionId) as DatabaseRow | undefined;
+    return row ? mapSession(row) : null;
+  }
+
+  public list(archived = false): readonly SessionRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT sessions.*, workspaces.root_path AS workspace_root
+         FROM sessions
+         INNER JOIN workspaces ON workspaces.id = sessions.workspace_id
+         WHERE sessions.archived_at ${archived ? "IS NOT NULL" : "IS NULL"}
+           AND workspaces.removed_at IS NULL
+         ORDER BY sessions.updated_at DESC`,
+      )
+      .all() as DatabaseRow[];
+    return rows.map(mapSession);
+  }
+
+  public listIds(): readonly string[] {
+    const rows = this.database.prepare("SELECT id FROM sessions").all() as DatabaseRow[];
+    return rows.map((row) => readRequiredString(row, "id"));
+  }
+
+  public listSearchDocuments(): readonly SessionSearchDocumentRecord[] {
+    const rows = this.database
+      .prepare("SELECT session_id, source_size, description FROM session_search_documents")
+      .all() as DatabaseRow[];
+    return rows.map((row) => ({
+      description: String(row.description ?? ""),
+      sessionId: readRequiredString(row, "session_id"),
+      sourceSize: readRequiredNumber(row, "source_size"),
+    }));
+  }
+
+  public replaceSearchDocument(
+    sessionId: string,
+    sourceSize: number,
+    description: string,
+    messages: readonly SessionSearchMessageInput[],
+  ): void {
+    const deleteMessages = this.database.prepare(
+      "DELETE FROM session_search_messages WHERE session_id = ?",
+    );
+    const insertMessage = this.database.prepare(
+      `INSERT INTO session_search_messages (
+         session_id, event_id, message_index, search_text, display_text
+       ) VALUES (?, ?, ?, ?, ?)`,
+    );
+    const upsertDocument = this.database.prepare(
+      `INSERT INTO session_search_documents (session_id, source_size, description)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         source_size = excluded.source_size,
+         description = excluded.description`,
+    );
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      deleteMessages.run(sessionId);
+      for (const message of messages) {
+        insertMessage.run(
+          sessionId,
+          message.eventId,
+          message.messageIndex,
+          message.normalizedText,
+          message.text,
+        );
+      }
+      upsertDocument.run(sessionId, sourceSize, description);
+      this.database.exec("COMMIT");
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  public searchMessages(normalizedQuery: string): readonly SessionSearchMessageMatch[] {
+    const escapedQuery = normalizedQuery
+      .replaceAll("\\", "\\\\")
+      .replaceAll("%", "\\%")
+      .replaceAll("_", "\\_");
+    const rows = this.database
+      .prepare(
+        `WITH matches AS (
+           SELECT session_id, event_id, display_text,
+                  row_number() OVER (
+                    PARTITION BY session_id
+                    ORDER BY CAST(message_index AS INTEGER) DESC
+                  ) AS rank
+           FROM session_search_messages
+           WHERE search_text LIKE ? ESCAPE '\\'
+         )
+         SELECT session_id, event_id, display_text
+         FROM matches
+         WHERE rank = 1`,
+      )
+      .all(`%${escapedQuery}%`) as DatabaseRow[];
+    return rows.map((row) => ({
+      eventId: readRequiredString(row, "event_id"),
+      sessionId: readRequiredString(row, "session_id"),
+      text: readRequiredString(row, "display_text"),
+    }));
+  }
+
+  public setArchived(sessionId: string, archivedAt: number | null, updatedAt: number): boolean {
+    return (
+      this.database
+        .prepare("UPDATE sessions SET archived_at = ?, updated_at = ? WHERE id = ?")
+        .run(archivedAt, updatedAt, sessionId).changes > 0
+    );
+  }
+
+  public updateIndex(sessionId: string, lastSeq: number, updatedAt: number): boolean {
+    return (
+      this.database
+        .prepare(
+          `UPDATE sessions
+           SET last_seq = ?, updated_at = ?
+           WHERE id = ? AND last_seq < ?`,
+        )
+        .run(lastSeq, updatedAt, sessionId, lastSeq).changes > 0
+    );
+  }
+
+  public updateModel(
+    sessionId: string,
+    providerId: string,
+    modelId: string,
+    thinkingLevel: ThinkingLevel | undefined,
+    updatedAt: number,
+  ): boolean {
+    return (
+      this.database
+        .prepare(
+          `UPDATE sessions
+           SET provider_id = ?, model_id = ?,
+               thinking_level = COALESCE(?, thinking_level), updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(providerId, modelId, thinkingLevel ?? null, updatedAt, sessionId).changes > 0
+    );
+  }
+
+  public updateTitle(sessionId: string, title: string, updatedAt: number): boolean {
+    return (
+      this.database
+        .prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
+        .run(title, updatedAt, sessionId).changes > 0
+    );
+  }
+}
+
+class SqliteWorkspaceRepository implements WorkspaceRepository {
+  public constructor(private readonly database: DatabaseSync) {}
+
+  public create(rootPath: string, createdAt: number): WorkspaceRecord {
+    const existing = this.database
+      .prepare("SELECT id FROM workspaces WHERE root_path = ?")
+      .get(rootPath) as DatabaseRow | undefined;
+    const workspaceId = existing ? readRequiredString(existing, "id") : randomUUID();
+
+    this.database
+      .prepare(
+        `INSERT INTO workspaces (id, root_path, created_at, updated_at, removed_at, sort_order)
+         SELECT ?, ?, ?, ?, NULL, COALESCE(MIN(sort_order), 0) - 1
+         FROM workspaces
+         WHERE removed_at IS NULL
+         ON CONFLICT(root_path) DO UPDATE SET
+           removed_at = NULL,
+           sort_order = excluded.sort_order,
+           updated_at = excluded.updated_at`,
+      )
+      .run(workspaceId, rootPath, createdAt, createdAt);
+
+    const workspace = this.find(workspaceId);
+    if (!workspace) throw new Error("Created workspace could not be read");
+    return workspace;
+  }
+
+  public find(workspaceId: string): WorkspaceRecord | null {
+    const row = this.database.prepare("SELECT * FROM workspaces WHERE id = ?").get(workspaceId) as
+      | DatabaseRow
+      | undefined;
+    return row ? mapWorkspace(row) : null;
+  }
+
+  public list(): readonly WorkspaceRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM workspaces
+         WHERE removed_at IS NULL
+         ORDER BY sort_order, updated_at DESC`,
+      )
+      .all() as DatabaseRow[];
+    return rows.map(mapWorkspace);
+  }
+
+  public remove(workspaceId: string, removedAt: number): boolean {
+    return (
+      this.database
+        .prepare(
+          "UPDATE workspaces SET removed_at = ?, updated_at = ? WHERE id = ? AND removed_at IS NULL",
+        )
+        .run(removedAt, removedAt, workspaceId).changes > 0
+    );
+  }
+
+  public reorder(workspaceIds: readonly string[], updatedAt: number): void {
+    const update = this.database.prepare(
+      `UPDATE workspaces
+       SET sort_order = ?, updated_at = ?
+       WHERE id = ? AND removed_at IS NULL`,
+    );
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const [sortOrder, workspaceId] of workspaceIds.entries()) {
+        if (update.run(sortOrder, updatedAt, workspaceId).changes !== 1) {
+          throw new Error("Workspace order changed while it was being saved");
+        }
+      }
+      this.database.exec("COMMIT");
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  public updateName(workspaceId: string, name: string, updatedAt: number): WorkspaceRecord | null {
+    const updated =
+      this.database
+        .prepare(
+          "UPDATE workspaces SET display_name = ?, updated_at = ? WHERE id = ? AND removed_at IS NULL",
+        )
+        .run(name, updatedAt, workspaceId).changes > 0;
+    return updated ? this.find(workspaceId) : null;
+  }
+}
+
+export interface HarnessDatabase {
+  boardTasks: BoardTaskRepository;
+  mcpServers: McpServerRepository;
+  memories: SqliteMemoryRepository;
+  appSettings: AppSettingRepository;
+  close(): void;
+  providerSettings: ProviderSettingRepository;
+  sessions: SessionRepository;
+  workspaces: WorkspaceRepository;
+}
+
+/** 打开 daemon 数据库，并在接收请求前执行尚未应用的 migration。 */
+export function openHarnessDatabase(databasePath: string): HarnessDatabase {
+  mkdirSync(dirname(databasePath), { mode: 0o700, recursive: true });
+  const database = new DatabaseSync(databasePath);
+  database.exec("PRAGMA foreign_keys = ON");
+  database.exec("PRAGMA journal_mode = WAL");
+  runMigrations(database);
+
+  return {
+    boardTasks: new SqliteBoardTaskRepository(database),
+    mcpServers: new SqliteMcpServerRepository(database),
+    memories: new SqliteMemoryRepository(database),
+    appSettings: new SqliteAppSettingRepository(database),
+    close: () => database.close(),
+    providerSettings: new SqliteProviderSettingRepository(database),
+    sessions: new SqliteSessionRepository(database),
+    workspaces: new SqliteWorkspaceRepository(database),
+  };
+}

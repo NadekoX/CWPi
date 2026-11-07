@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "externalBin": ["binaries/cwpi-node", "binaries/pi-computer-use-helper"],
+    "resources": {
+      "resources/daemon/": "daemon/",
+      "../../web/dist/": "web/"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

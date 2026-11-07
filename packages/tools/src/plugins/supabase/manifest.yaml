@@ -1,0 +1,26 @@
+id: supabase
+displayName: Supabase
+apiUrl: https://api.supabase.com
+description: Develop and troubleshoot Supabase integrations, optimize Postgres, and inspect connected projects.
+category: developer
+type: oauth
+gateway:
+  allowedPaths:
+    - '^/v1/(?:profile|organizations|projects)/?$'
+    - '^/v1/organizations/[^/]+(?:/projects)?/?$'
+    - '^/v1/projects/[^/]+(?:/health|/database/openapi|/config/database/(?:postgres|pooler|pgbouncer)|/readonly)?/?$'
+oauth:
+  authorizationPath: /v1/oauth/authorize
+  callbackUrl: http://localhost:4310/api/skill-connections/supabase/oauth/callback
+  tokenPath: /v1/oauth/token
+  clientId: ''
+  clientSecret: ''
+  pkce: true
+  tokenAuth: basic
+  tokenFormat: form
+  scopes: []
+skills:
+  - id: supabase
+    displayName: 开发与排障
+  - id: supabase-postgres-best-practices
+    displayName: Postgres 最佳实践

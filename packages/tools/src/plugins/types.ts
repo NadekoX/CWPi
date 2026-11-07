@@ -1,0 +1,77 @@
+import type { SkillType } from "../skills/types.js";
+import type { SkillFrontmatter } from "../utils/skill-document.js";
+
+export interface PluginOAuthDefinition {
+  authorizationParams?: Readonly<Record<string, string>>;
+  authorizationPath: string;
+  callbackUrl?: string;
+  clientId: string;
+  clientSecret: string;
+  pkce: boolean;
+  profile?: {
+    avatarUrlField?: string;
+    displayNameField?: string;
+    idField: string;
+    method?: "GET" | "POST";
+    path?: string;
+    source: "id-token" | "token" | "userinfo";
+    usernameField: string;
+  };
+  scopes: readonly string[];
+  tokenAuth: "basic" | "body";
+  tokenFormat: "form" | "json";
+  tokenPath: string;
+}
+
+export interface PluginGatewayDefinition {
+  allowedPaths: readonly string[];
+  deniedQueryValues?: Readonly<Record<string, readonly string[]>>;
+  headers?: Readonly<Record<string, string>>;
+  queryJsonPostPaths?: readonly string[];
+}
+
+export interface PluginSkillDefinition {
+  directory: string;
+  frontmatter: SkillFrontmatter;
+  description: string;
+  displayName: string;
+  icon?: string;
+  id: string;
+  instructions: string;
+  name: string;
+  type: SkillType;
+}
+
+export type PluginAppServerDefinition =
+  | {
+      args: readonly string[];
+      command: string;
+      type: "stdio";
+    }
+  | {
+      type: "http" | "sse";
+      url: string;
+    };
+
+export interface PluginAppDefinition {
+  credentialSource?: "plugin-oauth";
+  description: string;
+  displayName: string;
+  icon?: string;
+  id: string;
+  server: PluginAppServerDefinition;
+}
+
+export interface PluginDefinition {
+  apiUrl: string;
+  apps: readonly PluginAppDefinition[];
+  category: "developer" | "productivity";
+  description: string;
+  gateway: PluginGatewayDefinition;
+  id: string;
+  logo?: string;
+  name: string;
+  oauth?: PluginOAuthDefinition;
+  skills: readonly PluginSkillDefinition[];
+  type: SkillType;
+}

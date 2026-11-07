@@ -1,0 +1,33 @@
+{
+  "name": "@cwpi/agent-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./agent-message": "./src/utils/agent-message.ts",
+    "./context-pipeline": "./src/context/context-pipeline.ts",
+    "./harness-event": "./src/harness-event.ts",
+    "./model-response-preferences": "./src/model-response-preferences.ts",
+    "./thinking-level": "./src/thinking-level.ts",
+    "./tool-approval": "./src/tool-approval.ts",
+    "./user-input": "./src/user-input.ts",
+    "./working-state": "./src/working-state.ts",
+    "./mcp-contract": "./src/mcp-contract.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "catalog:",
+    "@earendil-works/pi-ai": "catalog:",
+    "@cwpi/memory": "workspace:*",
+    "@cwpi/policy": "workspace:*",
+    "@cwpi/tools": "workspace:*",
+    "es-toolkit": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

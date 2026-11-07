@@ -1,0 +1,40 @@
+import type { SkillSummary } from "@cwpi/tools";
+import type { WorkspaceAgentContext } from "../context/workspace-agent-context.js";
+import type { RunContextData } from "../harness-event.js";
+
+// 读取到 AGENTS.md 时，将内容包装成 <workspace_instructions>，让 Agent 遵守项目规范
+function buildAgentsContextPrompt(instructions: string | null): string {
+  return instructions === null
+    ? ""
+    : `<workspace_instructions source="AGENTS.md">\n${instructions}\n</workspace_instructions>`;
+}
+
+// 存在 Skills 时，生成 <available_skills> 清单，并告诉 Agent何时调用 load_skill
+/**
+ * 提示词翻译：
+ * 根据用户的意图从描述中选择适用的技能。
+ * 用户显式引用的 Skill 由 Runtime 注入正文，不重复要求模型加载。
+ * 否则，在遵循技能指示之前调用load_skill。
+ * 当目录不足时，使用find_skill或get_skill，并仅加载当前任务所需的支持资源。
+ */
+function buildSkillsContextPrompt(skills: readonly SkillSummary[]): string {
+  if (skills.length === 0) return "";
+  const catalog = skills.map((skill) => `- ${skill.id}: ${skill.description}`).join("\n");
+  return `<available_skills>\n${catalog}\n</available_skills>
+Select applicable Skills from their descriptions based on the user's intent. Explicit $skill-name invocations are expanded into skill_content in the user message. Follow that content directly; call load_skill when the instructions are not already present. Use find_skill or get_skill when the catalog is insufficient, and load only the supporting resources needed for the current task.`;
+}
+
+export function buildWorkspaceContextPrompts(context: WorkspaceAgentContext): RunContextData[] {
+  return [
+    {
+      content: buildAgentsContextPrompt(context.agentsInstructions),
+      label: "AGENTS.md",
+      type: "agents",
+    },
+    {
+      content: buildSkillsContextPrompt(context.availableSkills),
+      label: "Available Skills",
+      type: "available-skills",
+    },
+  ].filter(({ content }) => content.length > 0);
+}

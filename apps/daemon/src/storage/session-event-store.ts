@@ -1,0 +1,513 @@
+import { createReadStream } from "node:fs";
+import { mkdir, open, readFile, stat, truncate } from "node:fs/promises";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import {
+  type AgentMessage,
+  type ContextCheckpointRecord,
+  type ContextCompactedData,
+  type HarnessEvent,
+  HarnessEventType,
+  isCommandProcessSnapshot,
+  isContextCheckpointRestoredData,
+  isContextCompactedData,
+  isContextWorkingStateResetData,
+  isInputExpiredData,
+  isInputRequestedData,
+  isInputResolvedData,
+  isMessageBranchStartedData,
+  isPlanUpdatedData,
+  isRunToolsLoadedData,
+  isSubAgentStartedData,
+  isSubAgentTerminalData,
+  isTodoUpdatedData,
+  type PlanUpdatedData,
+  type SessionId,
+  selectActiveSessionEvents,
+  type TodoUpdatedData,
+} from "@cwpi/agent-runtime";
+import { isError, isPlainObject } from "es-toolkit";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
+
+const SESSION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const HARNESS_EVENT_TYPES = new Set<string>(Object.values(HarnessEventType));
+const TRANSIENT_EVENT_TYPES = new Set<string>([
+  HarnessEventType.MESSAGE_DELTA,
+  HarnessEventType.TOOL_UPDATED,
+  HarnessEventType.SUBAGENT_MESSAGE_DELTA,
+  HarnessEventType.SUBAGENT_TOOL_UPDATED,
+  HarnessEventType.COMMAND_UPDATED,
+]);
+const USAGE_EVENT_TYPES = new Set<string>([
+  HarnessEventType.RUN_STARTED,
+  HarnessEventType.SUBAGENT_STARTED,
+  HarnessEventType.MESSAGE_COMPLETED,
+  HarnessEventType.SUBAGENT_MESSAGE_COMPLETED,
+  HarnessEventType.CONTEXT_COMPACTED,
+  HarnessEventType.SUBAGENT_CONTEXT_COMPACTED,
+]);
+const StoredHarnessEventSchema = Type.Object({
+  data: Type.Unknown(),
+  id: Type.String({ minLength: 1 }),
+  runId: Type.Optional(Type.String({ minLength: 1 })),
+  seq: Type.Integer({ minimum: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  timestamp: Type.Integer({ minimum: 0 }),
+  type: Type.String({ minLength: 1 }),
+});
+
+type StoredHarnessEvent = Static<typeof StoredHarnessEventSchema>;
+
+export interface SessionEventSnapshot {
+  contextCheckpoint: ContextCompactedData | null;
+  contextCheckpointEventSeq: number | null;
+  contextCheckpointHistory: readonly ContextCheckpointRecord[];
+  contextCheckpointTailStartMessageIndex: number | null;
+  events: readonly HarnessEvent[];
+  lastPersistedSeq: number;
+  messages: readonly AgentMessage[];
+  plan: PlanUpdatedData | null;
+  todos: TodoUpdatedData | null;
+}
+
+function isAgentMessage(value: unknown): value is AgentMessage {
+  if (!isPlainObject(value) || typeof value.timestamp !== "number") return false;
+  if (value.role === "user")
+    return typeof value.content === "string" || Array.isArray(value.content);
+  if (value.role === "assistant") {
+    return (
+      Array.isArray(value.content) &&
+      typeof value.provider === "string" &&
+      typeof value.model === "string" &&
+      typeof value.stopReason === "string"
+    );
+  }
+  return (
+    value.role === "toolResult" &&
+    typeof value.toolCallId === "string" &&
+    typeof value.toolName === "string" &&
+    Array.isArray(value.content) &&
+    typeof value.isError === "boolean"
+  );
+}
+
+function parseHarnessEvent(value: unknown, expectedSessionId: SessionId): HarnessEvent {
+  if (!Value.Check(StoredHarnessEventSchema, value)) {
+    throw new Error("Session event is invalid");
+  }
+  const event = value as StoredHarnessEvent;
+  if (event.sessionId !== expectedSessionId || !HARNESS_EVENT_TYPES.has(event.type)) {
+    throw new Error("Session event is invalid");
+  }
+
+  if (
+    (event.type === HarnessEventType.MESSAGE_STARTED ||
+      event.type === HarnessEventType.MESSAGE_COMPLETED) &&
+    !isAgentMessage(event.data)
+  ) {
+    throw new Error("Session message event is invalid");
+  }
+  if (
+    event.type === HarnessEventType.MESSAGE_BRANCH_STARTED &&
+    !isMessageBranchStartedData(event.data)
+  ) {
+    throw new Error("Session message branch event is invalid");
+  }
+  if (event.type === HarnessEventType.CONTEXT_COMPACTED && !isContextCompactedData(event.data)) {
+    throw new Error("Session context checkpoint event is invalid");
+  }
+  if (
+    event.type === HarnessEventType.CONTEXT_CHECKPOINT_RESTORED &&
+    !isContextCheckpointRestoredData(event.data)
+  ) {
+    throw new Error("Session context checkpoint restoration event is invalid");
+  }
+  if (
+    event.type === HarnessEventType.CONTEXT_WORKING_STATE_RESET &&
+    !isContextWorkingStateResetData(event.data)
+  ) {
+    throw new Error("Session working state reset event is invalid");
+  }
+  if (event.type === HarnessEventType.PLAN_UPDATED && !isPlanUpdatedData(event.data)) {
+    throw new Error("Session plan event is invalid");
+  }
+  if (event.type === HarnessEventType.TODO_UPDATED && !isTodoUpdatedData(event.data)) {
+    throw new Error("Session todo event is invalid");
+  }
+  if (event.type === HarnessEventType.INPUT_REQUESTED && !isInputRequestedData(event.data)) {
+    throw new Error("Session input request event is invalid");
+  }
+  if (event.type === HarnessEventType.INPUT_RESOLVED && !isInputResolvedData(event.data)) {
+    throw new Error("Session input resolution event is invalid");
+  }
+  if (event.type === HarnessEventType.INPUT_EXPIRED && !isInputExpiredData(event.data)) {
+    throw new Error("Session input expiration event is invalid");
+  }
+  if (event.type === HarnessEventType.SUBAGENT_STARTED && !isSubAgentStartedData(event.data)) {
+    throw new Error("Session subagent start event is invalid");
+  }
+  if (
+    (event.type === HarnessEventType.RUN_TOOLS_LOADED ||
+      event.type === HarnessEventType.SUBAGENT_TOOLS_LOADED) &&
+    !isRunToolsLoadedData(event.data)
+  ) {
+    throw new Error("Session tool load event is invalid");
+  }
+  if (
+    (event.type === HarnessEventType.SUBAGENT_COMPLETED ||
+      event.type === HarnessEventType.SUBAGENT_FAILED ||
+      event.type === HarnessEventType.SUBAGENT_ABORTED) &&
+    !isSubAgentTerminalData(event.data)
+  ) {
+    throw new Error("Session subagent terminal event is invalid");
+  }
+  if (
+    (event.type === HarnessEventType.SUBAGENT_MESSAGE_STARTED ||
+      event.type === HarnessEventType.SUBAGENT_MESSAGE_COMPLETED) &&
+    (!isPlainObject(event.data) ||
+      typeof event.data.executionId !== "string" ||
+      !isAgentMessage(event.data.message))
+  ) {
+    throw new Error("Session subagent message event is invalid");
+  }
+  if (
+    event.type.startsWith("subagent.") &&
+    (!isPlainObject(event.data) || typeof event.data.executionId !== "string")
+  ) {
+    throw new Error("Session subagent event is invalid");
+  }
+  if (
+    (event.type === HarnessEventType.COMMAND_STARTED ||
+      event.type === HarnessEventType.COMMAND_EXITED) &&
+    !isCommandProcessSnapshot(event.data)
+  ) {
+    throw new Error("Session command process event is invalid");
+  }
+  if (
+    event.type === HarnessEventType.SUBAGENT_CONTEXT_COMPACTED &&
+    !isContextCompactedData(event.data)
+  ) {
+    throw new Error("Session subagent context checkpoint event is invalid");
+  }
+  if (
+    (event.type === HarnessEventType.SUBAGENT_TOOL_STARTED ||
+      event.type === HarnessEventType.SUBAGENT_TOOL_COMPLETED ||
+      event.type === HarnessEventType.SUBAGENT_TOOL_FAILED ||
+      event.type === HarnessEventType.SUBAGENT_TOOL_SKIPPED) &&
+    (!isPlainObject(event.data) ||
+      typeof event.data.toolCallId !== "string" ||
+      typeof event.data.toolName !== "string")
+  ) {
+    throw new Error("Session subagent tool event is invalid");
+  }
+
+  return event as unknown as HarnessEvent;
+}
+
+function sessionFileName(sessionId: SessionId): string {
+  if (!SESSION_ID_PATTERN.test(sessionId)) {
+    throw new Error("Session id is invalid");
+  }
+  return `${sessionId}.jsonl`;
+}
+
+export function shouldPersistSessionEvent(event: HarnessEvent): boolean {
+  return !TRANSIENT_EVENT_TYPES.has(event.type);
+}
+
+/** Session JSONL 是对话事实来源；每个 session 的写入在此处串行化。 */
+export class SessionEventStore {
+  private readonly lastSeqBySession = new Map<SessionId, number>();
+  private readonly revisions = new Map<SessionId, number>();
+  private readonly writeTails = new Map<SessionId, Promise<void>>();
+
+  public constructor(private readonly directory: string) {}
+
+  public async initialize(): Promise<void> {
+    await mkdir(this.directory, { mode: 0o700, recursive: true });
+  }
+
+  public async load(sessionId: SessionId, signal?: AbortSignal): Promise<SessionEventSnapshot> {
+    signal?.throwIfAborted();
+    const pendingWrite = this.writeTails.get(sessionId);
+    if (pendingWrite !== undefined) await pendingWrite;
+
+    signal?.throwIfAborted();
+    return this.readSnapshot(sessionId, signal);
+  }
+
+  public async loadRunEvents(
+    sessionId: SessionId,
+    runIds: ReadonlySet<string>,
+    eventTypes: ReadonlySet<string>,
+    signal: AbortSignal = AbortSignal.timeout(30_000),
+  ): Promise<ReadonlyMap<string, readonly HarnessEvent[]>> {
+    const pendingWrite = this.writeTails.get(sessionId);
+    if (pendingWrite !== undefined) await pendingWrite;
+
+    const eventsByRunId = new Map<string, HarnessEvent[]>();
+    if (runIds.size === 0) return eventsByRunId;
+
+    const stream = createReadStream(join(this.directory, sessionFileName(sessionId)), {
+      encoding: "utf8",
+      signal,
+    });
+    try {
+      for await (const line of createInterface({ input: stream, crlfDelay: Infinity })) {
+        // Appended event metadata fits in the tail; skip large message payloads before JSON.parse.
+        const metadata =
+          /,"runId":"([^"]+)","seq":\d+,"sessionId":"[^"]+","timestamp":\d+,"type":"([^"]+)"}$/.exec(
+            line.slice(-256),
+          );
+        const runId = metadata?.[1];
+        const type = metadata?.[2];
+        if (
+          runId === undefined ||
+          type === undefined ||
+          !runIds.has(runId) ||
+          !eventTypes.has(type)
+        )
+          continue;
+        const event = parseHarnessEvent(JSON.parse(line) as unknown, sessionId);
+        if (event.runId !== runId || event.type !== type) continue;
+        const events = eventsByRunId.get(runId) ?? [];
+        events.push(event);
+        eventsByRunId.set(runId, events);
+      }
+    } catch (error: unknown) {
+      if (!isError(error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    } finally {
+      stream.destroy();
+    }
+    return eventsByRunId;
+  }
+
+  public async loadUsageEvents(
+    sessionId: SessionId,
+    since: number,
+    signal: AbortSignal,
+  ): Promise<readonly HarnessEvent[]> {
+    const pendingWrite = this.writeTails.get(sessionId);
+    if (pendingWrite !== undefined) await pendingWrite;
+    signal.throwIfAborted();
+
+    const events: HarnessEvent[] = [];
+    const stream = createReadStream(join(this.directory, sessionFileName(sessionId)), {
+      encoding: "utf8",
+      signal,
+    });
+    try {
+      for await (const line of createInterface({ input: stream, crlfDelay: Infinity })) {
+        const metadata = /,"timestamp":(\d+),"type":"([^"]+)"}$/.exec(line.slice(-128));
+        if (metadata) {
+          const type = metadata[2];
+          if (!type || !USAGE_EVENT_TYPES.has(type)) continue;
+          if (
+            type !== HarnessEventType.RUN_STARTED &&
+            type !== HarnessEventType.SUBAGENT_STARTED &&
+            Number(metadata[1]) < since
+          )
+            continue;
+        }
+        const event = parseHarnessEvent(JSON.parse(line) as unknown, sessionId);
+        if (
+          USAGE_EVENT_TYPES.has(event.type) &&
+          (event.type === HarnessEventType.RUN_STARTED ||
+            event.type === HarnessEventType.SUBAGENT_STARTED ||
+            event.timestamp >= since)
+        ) {
+          events.push(event);
+        }
+      }
+    } catch (error: unknown) {
+      if (error instanceof SyntaxError) {
+        stream.destroy();
+        // 复用会话加载时对崩溃留下的不完整末行的修复，正常读取不构建完整快照。
+        await this.load(sessionId, signal);
+        return this.loadUsageEvents(sessionId, since, signal);
+      }
+      if (!isError(error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    } finally {
+      stream.destroy();
+    }
+    return events;
+  }
+
+  public getRevision(sessionId: SessionId): number {
+    return this.revisions.get(sessionId) ?? 0;
+  }
+
+  public async getSize(sessionId: SessionId): Promise<number> {
+    const pendingWrite = this.writeTails.get(sessionId);
+    if (pendingWrite !== undefined) await pendingWrite;
+    try {
+      return (await stat(join(this.directory, sessionFileName(sessionId)))).size;
+    } catch (error: unknown) {
+      if (isError(error) && "code" in error && error.code === "ENOENT") return 0;
+      throw error;
+    }
+  }
+
+  private async readSnapshot(
+    sessionId: SessionId,
+    signal?: AbortSignal,
+  ): Promise<SessionEventSnapshot> {
+    const path = join(this.directory, sessionFileName(sessionId));
+    let source: string;
+    try {
+      source = await readFile(path, { encoding: "utf8", signal });
+    } catch (error: unknown) {
+      if (isError(error) && "code" in error && error.code === "ENOENT") {
+        if (!this.lastSeqBySession.has(sessionId)) this.lastSeqBySession.set(sessionId, 0);
+        return {
+          contextCheckpoint: null,
+          contextCheckpointEventSeq: null,
+          contextCheckpointHistory: [],
+          contextCheckpointTailStartMessageIndex: null,
+          events: [],
+          lastPersistedSeq: 0,
+          messages: [],
+          plan: null,
+          todos: null,
+        };
+      }
+      throw error;
+    }
+
+    const hasTrailingNewline = source.endsWith("\n");
+    const lines = source.split("\n");
+    if (hasTrailingNewline) lines.pop();
+    const events: HarnessEvent[] = [];
+    let previousSeq = 0;
+
+    for (const [index, line] of lines.entries()) {
+      signal?.throwIfAborted();
+      if (line.length === 0) throw new Error("Session JSONL contains an empty middle line");
+      try {
+        const event = parseHarnessEvent(JSON.parse(line) as unknown, sessionId);
+        if (event.seq <= previousSeq) {
+          throw new Error("Session event sequence is not strictly increasing");
+        }
+        previousSeq = event.seq;
+        events.push(event);
+      } catch (error: unknown) {
+        const isIncompleteLastLine = index === lines.length - 1 && !hasTrailingNewline;
+        if (isIncompleteLastLine && error instanceof SyntaxError) {
+          const lastCompleteLineEnd = source.lastIndexOf("\n") + 1;
+          await truncate(path, lastCompleteLineEnd);
+          break;
+        }
+        throw error;
+      }
+    }
+
+    const activeEvents = selectActiveSessionEvents(events);
+    const messages: AgentMessage[] = [];
+    const contextCheckpointHistory: ContextCheckpointRecord[] = [];
+    let contextCheckpointRecord: ContextCheckpointRecord | null = null;
+    let contextCheckpointTailStartMessageIndex: number | null = null;
+    let plan: PlanUpdatedData | null = null;
+    let todos: TodoUpdatedData | null = null;
+    for (const event of activeEvents) {
+      if (event.type === HarnessEventType.MESSAGE_COMPLETED && isAgentMessage(event.data)) {
+        messages.push(event.data);
+      }
+      if (event.type === HarnessEventType.CONTEXT_COMPACTED && isContextCompactedData(event.data)) {
+        const compactedData = event.data;
+        if (
+          compactedData.previousCompactionId !== undefined &&
+          !contextCheckpointHistory.some(
+            (record) => record.data.compactionId === compactedData.previousCompactionId,
+          )
+        ) {
+          throw new Error("Session context checkpoint parent is invalid");
+        }
+        const record = { data: compactedData, eventSeq: event.seq };
+        contextCheckpointHistory.push(record);
+        contextCheckpointRecord = record;
+        contextCheckpointTailStartMessageIndex = null;
+      } else if (
+        event.type === HarnessEventType.CONTEXT_CHECKPOINT_RESTORED &&
+        isContextCheckpointRestoredData(event.data)
+      ) {
+        const restoredData = event.data;
+        const restored = contextCheckpointHistory.find(
+          (record) => record.eventSeq === restoredData.sourceEventSeq,
+        );
+        if (restored === undefined) {
+          throw new Error("Session context checkpoint restoration target is invalid");
+        }
+        contextCheckpointRecord = restored;
+        contextCheckpointTailStartMessageIndex = messages.length;
+      } else if (event.type === HarnessEventType.CONTEXT_WORKING_STATE_RESET) {
+        plan = null;
+        todos = null;
+      } else if (event.type === HarnessEventType.PLAN_UPDATED && isPlanUpdatedData(event.data)) {
+        plan = event.data;
+      } else if (event.type === HarnessEventType.TODO_UPDATED && isTodoUpdatedData(event.data)) {
+        todos = event.data;
+      }
+    }
+    const contextCheckpoint = contextCheckpointRecord?.data ?? null;
+    if (contextCheckpoint !== null && contextCheckpoint.sourceMessageCount > messages.length) {
+      throw new Error("Session context checkpoint exceeds the stored message history");
+    }
+    const knownSeq = this.lastSeqBySession.get(sessionId) ?? 0;
+    if (previousSeq > knownSeq) this.lastSeqBySession.set(sessionId, previousSeq);
+    return {
+      contextCheckpoint,
+      contextCheckpointEventSeq: contextCheckpointRecord?.eventSeq ?? null,
+      contextCheckpointHistory,
+      contextCheckpointTailStartMessageIndex,
+      events,
+      lastPersistedSeq: previousSeq,
+      messages,
+      plan,
+      todos,
+    };
+  }
+
+  public async append(event: HarnessEvent): Promise<void> {
+    if (!shouldPersistSessionEvent(event)) {
+      throw new Error(`Transient event ${event.type} must not be written to Session JSONL`);
+    }
+
+    this.revisions.set(event.sessionId, this.getRevision(event.sessionId) + 1);
+    const previous = this.writeTails.get(event.sessionId) ?? Promise.resolve();
+    const operation = previous.then(() => this.appendNow(event));
+    const tail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.writeTails.set(event.sessionId, tail);
+    try {
+      await operation;
+    } finally {
+      if (this.writeTails.get(event.sessionId) === tail) {
+        this.writeTails.delete(event.sessionId);
+      }
+    }
+  }
+
+  private async appendNow(event: HarnessEvent): Promise<void> {
+    let lastSeq = this.lastSeqBySession.get(event.sessionId);
+    if (lastSeq === undefined) {
+      lastSeq = (await this.readSnapshot(event.sessionId)).lastPersistedSeq;
+    }
+    if (event.seq <= lastSeq) {
+      throw new Error("Session event sequence must be strictly increasing");
+    }
+
+    const path = join(this.directory, sessionFileName(event.sessionId));
+    const handle = await open(path, "a", 0o600);
+    try {
+      await handle.write(`${JSON.stringify(event)}\n`);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    this.lastSeqBySession.set(event.sessionId, event.seq);
+  }
+}

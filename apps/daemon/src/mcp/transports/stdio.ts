@@ -1,0 +1,240 @@
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  type JSONRPCMessage,
+  serializeMessage,
+  type Transport,
+} from "@modelcontextprotocol/client";
+import {
+  type SandboxedProcess,
+  type SandboxProcessInput,
+  spawnSandboxedProcess,
+} from "@cwpi/sandbox";
+import { McpError, McpErrorCode } from "../errors.js";
+import { McpStdioMessageBuffer } from "../utils/stdio-message-buffer.js";
+
+const MAX_MESSAGE_BYTES = 24 * 1024 * 1024;
+const MAX_PENDING_BYTES = 8 * 1024 * 1024;
+const MAX_STDERR_BYTES = 1024 * 1024;
+const MAX_BYTES_PER_SECOND = 32 * 1024 * 1024;
+const MAX_MESSAGES_PER_SECOND = 1_024;
+const WRITE_TIMEOUT_MS = 15_000;
+
+export interface McpProcessLaunch {
+  commandId: string;
+  command: string;
+  args: readonly string[];
+  cwd: string;
+  environment: Readonly<Record<string, string>>;
+  credentials: Readonly<Record<string, string>>;
+  hasHostAccess: boolean;
+}
+
+/** 使用 SDK 的协议解析器；Host 独立控制环境、进程组和有界 I/O。 */
+export class McpStdioTransport implements Transport {
+  public onclose?: () => void;
+  public onerror?: (error: Error) => void;
+  public onmessage?: (message: JSONRPCMessage) => void;
+
+  private sandboxedProcess: SandboxedProcess | undefined;
+  private readonly buffer = new McpStdioMessageBuffer(MAX_MESSAGE_BYTES);
+  private closing: Promise<void> | undefined;
+  private isStarted = false;
+  private isClosed = false;
+  private pendingBytes = 0;
+  private stderrBytes = 0;
+  private windowStartedAt = performance.now();
+  private windowBytes = 0;
+  private windowMessages = 0;
+
+  public constructor(
+    private readonly launch: McpProcessLaunch,
+    private readonly sandbox: Omit<
+      SandboxProcessInput,
+      "args" | "command" | "commandId" | "credentials" | "environment"
+    > | null,
+    private readonly verifyBeforeSpawn: () => void,
+  ) {}
+
+  /** SDK 通过这两个访问器识别 stdio，并在版本探测超时后回退到 initialize。 */
+  public get stderr(): SandboxedProcess["process"]["stderr"] | null {
+    return this.sandboxedProcess?.process.stderr ?? null;
+  }
+
+  public get pid(): number | null {
+    return this.sandboxedProcess?.process.pid ?? null;
+  }
+
+  public async start(): Promise<void> {
+    if (this.isStarted || this.isClosed) {
+      throw new McpError(McpErrorCode.CONNECTION_FAILED, "MCP 进程不可重复启动");
+    }
+    this.verifyBeforeSpawn();
+    this.isStarted = true;
+    let sandboxedProcess: SandboxedProcess;
+    try {
+      sandboxedProcess =
+        this.sandbox === null
+          ? await spawnTrustedHostProcess(this.launch)
+          : await spawnSandboxedProcess({
+              ...this.sandbox,
+              args: this.launch.args,
+              command: this.launch.command,
+              commandId: this.launch.commandId,
+              credentials: Object.entries(this.launch.credentials).map(([name, value]) => ({
+                name,
+                value,
+              })),
+              environment: this.launch.environment,
+            });
+    } catch {
+      this.isClosed = true;
+      throw new McpError(
+        McpErrorCode.CAPABILITY_UNAVAILABLE,
+        "无法启动 MCP 进程，请检查平台能力与本地服务配置",
+      );
+    }
+    this.sandboxedProcess = sandboxedProcess;
+    const child = sandboxedProcess.process;
+    child.stdout.on("data", (chunk: Buffer) => this.receive(chunk));
+    child.stderr.on("data", (chunk: Buffer) => {
+      // stderr 可能含服务器凭据或文件内容，只统计大小，不输出原文。
+      this.stderrBytes += chunk.byteLength;
+      if (this.stderrBytes > MAX_STDERR_BYTES)
+        this.fail(McpErrorCode.LIMIT_EXCEEDED, "MCP stderr 超过输出限额");
+    });
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      stream.on("error", () => this.fail(McpErrorCode.CONNECTION_FAILED, "MCP 进程通信失败"));
+    }
+    child.once("exit", () => {
+      // 父进程退出后仍可能有子进程持有管道，继续收敛整个进程组。
+      void this.close().catch(() =>
+        this.onerror?.(new McpError(McpErrorCode.CONNECTION_FAILED, "MCP 进程回收失败")),
+      );
+    });
+  }
+
+  public async send(message: JSONRPCMessage): Promise<void> {
+    const child = this.sandboxedProcess?.process;
+    if (child === undefined || this.isClosed)
+      throw new McpError(McpErrorCode.CONNECTION_FAILED, "MCP 进程未连接");
+    const serialized = serializeMessage(message);
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes > MAX_MESSAGE_BYTES || this.pendingBytes + bytes > MAX_PENDING_BYTES) {
+      throw new McpError(McpErrorCode.LIMIT_EXCEEDED, "MCP 待发送数据超过限额");
+    }
+    this.pendingBytes += bytes;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new McpError(McpErrorCode.CONNECTION_FAILED, "MCP 进程写入超时"));
+          this.fail(McpErrorCode.CONNECTION_FAILED, "MCP 进程写入超时");
+        }, WRITE_TIMEOUT_MS);
+        child.stdin.write(serialized, (error) => {
+          clearTimeout(timer);
+          if (error) reject(new McpError(McpErrorCode.CONNECTION_FAILED, "MCP 进程写入失败"));
+          else resolve();
+        });
+      });
+    } finally {
+      this.pendingBytes -= bytes;
+    }
+  }
+
+  public close(): Promise<void> {
+    if (this.closing !== undefined) return this.closing;
+    this.isClosed = true;
+    this.closing = Promise.resolve().then(async () => {
+      const sandboxedProcess = this.sandboxedProcess;
+      const child = sandboxedProcess?.process;
+      try {
+        await sandboxedProcess?.close();
+      } finally {
+        child?.stdin.destroy();
+        child?.stdout.destroy();
+        child?.stderr.destroy();
+        this.sandboxedProcess = undefined;
+        this.buffer.clear();
+        this.onclose?.();
+      }
+    });
+    return this.closing;
+  }
+
+  private receive(chunk: Buffer): void {
+    if (this.isClosed) return;
+    if (performance.now() - this.windowStartedAt >= 1_000) {
+      this.windowStartedAt = performance.now();
+      this.windowBytes = 0;
+      this.windowMessages = 0;
+    }
+    this.windowBytes += chunk.byteLength;
+    if (this.windowBytes > MAX_BYTES_PER_SECOND) {
+      this.fail(McpErrorCode.LIMIT_EXCEEDED, "MCP 输出速率超过限额");
+      return;
+    }
+    try {
+      this.buffer.append(chunk, (message) => {
+        if (this.isClosed) return;
+        this.windowMessages += 1;
+        if (this.windowMessages > MAX_MESSAGES_PER_SECOND) {
+          this.fail(McpErrorCode.LIMIT_EXCEEDED, "MCP 消息速率超过限额");
+          return;
+        }
+        this.onmessage?.(message);
+      });
+    } catch {
+      this.fail(McpErrorCode.CONNECTION_FAILED, "MCP stdout 包含无效协议数据或消息超限");
+    }
+  }
+
+  private fail(code: McpErrorCode, message: string): void {
+    if (this.isClosed) return;
+    this.onerror?.(new McpError(code, message));
+    void this.close().catch(() =>
+      this.onerror?.(new McpError(McpErrorCode.CONNECTION_FAILED, "MCP 进程清理失败")),
+    );
+  }
+}
+
+async function spawnTrustedHostProcess(launch: McpProcessLaunch): Promise<SandboxedProcess> {
+  const child = spawn(launch.command, launch.args, {
+    cwd: launch.cwd,
+    detached: true,
+    windowsHide: true,
+    env: { ...launch.environment, ...launch.credentials },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  const process = child as ChildProcessWithoutNullStreams;
+  const exited = new Promise<void>((resolve) => process.once("exit", () => resolve()));
+  let closing: Promise<void> | undefined;
+  const signalGroup = (signal: NodeJS.Signals) => {
+    if (process.pid === undefined) return;
+    try {
+      // The built-in Windows helper is a single native process; Windows has no Unix process groups.
+      globalThis.process.kill(
+        globalThis.process.platform === "win32" ? process.pid : -process.pid,
+        signal,
+      );
+    } catch (error: unknown) {
+      if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+    }
+  };
+  return {
+    process,
+    close: () =>
+      (closing ??= (async () => {
+        if (process.exitCode !== null || process.signalCode !== null) return;
+        signalGroup("SIGTERM");
+        await Promise.race([exited, delay(500)]);
+        if (process.exitCode === null && process.signalCode === null) {
+          signalGroup("SIGKILL");
+          await exited;
+        }
+      })()),
+  };
+}

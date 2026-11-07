@@ -1,0 +1,43 @@
+id: notion
+displayName: Notion
+apiUrl: https://api.notion.com
+description: Search Notion and prepare knowledge records, meeting materials, research reports, and implementation plans.
+category: productivity
+type: oauth
+gateway:
+  allowedPaths:
+    - '^/v1/search$'
+    - '^/v1/(?:pages|blocks|databases|data_sources)/[^/]+/?$'
+    - '^/v1/(?:blocks/[^/]+/children|pages/[^/]+/properties/[^/]+|data_sources/[^/]+/query)/?$'
+  headers:
+    Notion-Version: '2026-03-11'
+  queryJsonPostPaths:
+    - '^/v1/search$'
+    - '^/v1/data_sources/[^/]+/query/?$'
+oauth:
+  authorizationParams:
+    owner: user
+  authorizationPath: /v1/oauth/authorize
+  callbackUrl: http://localhost:4310/api/skill-connections/notion/oauth/callback
+  tokenPath: /v1/oauth/token
+  clientId: ''
+  clientSecret: ''
+  pkce: false
+  tokenAuth: basic
+  tokenFormat: json
+  scopes: []
+  profile:
+    source: token
+    idField: bot_id
+    usernameField: workspace_id
+    displayNameField: workspace_name
+    avatarUrlField: workspace_icon
+skills:
+  - id: notion-knowledge-capture
+    displayName: 知识整理
+  - id: notion-meeting-intelligence
+    displayName: 会议准备
+  - id: notion-research-documentation
+    displayName: 研究文档
+  - id: notion-spec-to-implementation
+    displayName: 需求转实施

@@ -1,0 +1,15 @@
+{
+  "name": "@cwpi/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "desktop:build": "node scripts/release.mjs",
+    "desktop:release": "node scripts/release.mjs --release",
+    "tauri": "tauri",
+    "prepare:bundle": "pnpm --dir ../.. --filter @cwpi/web build && node scripts/prepare-bundle.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "catalog:"
+  }
+}

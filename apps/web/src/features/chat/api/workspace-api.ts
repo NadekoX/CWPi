@@ -1,0 +1,187 @@
+import {
+  type RunInputContextReference,
+  UserContextReferenceKind,
+} from "@cwpi/agent-runtime/user-input";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
+import { apiRequest } from "../../../api/request";
+import { FileOpenResultStatus } from "../../../shared/constants/file-open";
+import type { ChatWorkspace } from "../data/chat";
+
+const WorkspaceSchema = Type.Object({
+  createdAt: Type.Integer({ minimum: 0 }),
+  id: Type.String({ minLength: 1 }),
+  isAvailable: Type.Boolean(),
+  name: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+  rootPath: Type.String({ minLength: 1 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+});
+
+const WorkspaceListSchema = Type.Array(WorkspaceSchema);
+const WorkspaceContextItemListSchema = Type.Array(
+  Type.Object({
+    kind: Type.Union([
+      Type.Literal(UserContextReferenceKind.FILE),
+      Type.Literal(UserContextReferenceKind.FOLDER),
+      Type.Literal(UserContextReferenceKind.IMAGE),
+    ]),
+    path: Type.String({ minLength: 1 }),
+  }),
+);
+const WorkspaceFileListSchema = Type.Object({
+  items: WorkspaceContextItemListSchema,
+  truncated: Type.Boolean(),
+});
+const WorkspaceFileContentSchema = Type.Object({
+  content: Type.String(),
+  path: Type.String({ minLength: 1 }),
+});
+type Workspace = Static<typeof WorkspaceSchema>;
+
+export type WorkspaceFileList = Static<typeof WorkspaceFileListSchema>;
+export type WorkspaceFileContent = Static<typeof WorkspaceFileContentSchema>;
+
+function toChatWorkspace(workspace: Workspace): ChatWorkspace {
+  return {
+    createdAt: new Date(workspace.createdAt).toISOString(),
+    id: workspace.id,
+    isAvailable: workspace.isAvailable,
+    name:
+      workspace.name ??
+      workspace.rootPath.split(/[\\/]/).filter(Boolean).at(-1) ??
+      workspace.rootPath,
+    path: workspace.rootPath,
+  };
+}
+
+function readWorkspace(value: unknown): ChatWorkspace {
+  if (!Value.Check(WorkspaceSchema, value)) {
+    throw new Error("daemon 返回了无效的 Workspace 响应");
+  }
+  return toChatWorkspace(value);
+}
+
+export async function listWorkspaces(signal?: AbortSignal): Promise<readonly ChatWorkspace[]> {
+  const body = (await (
+    await apiRequest("/api/workspaces", signal ? { signal } : undefined)
+  ).json()) as unknown;
+  if (!Value.Check(WorkspaceListSchema, body)) {
+    throw new Error("daemon 返回了无效的 Workspace 列表");
+  }
+  return body.map(toChatWorkspace);
+}
+
+export async function listWorkspaceContextItems(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<readonly RunInputContextReference[]> {
+  const body = (await (
+    await apiRequest(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/context-items`,
+      signal ? { signal } : undefined,
+    )
+  ).json()) as unknown;
+  if (!Value.Check(WorkspaceContextItemListSchema, body)) {
+    throw new Error("daemon 返回了无效的 Workspace 上下文列表");
+  }
+  return body;
+}
+
+export async function listWorkspaceFiles(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceFileList> {
+  const body = (await (
+    await apiRequest(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/files`,
+      signal ? { signal } : undefined,
+    )
+  ).json()) as unknown;
+  if (!Value.Check(WorkspaceFileListSchema, body)) {
+    throw new Error("daemon 返回了无效的 Workspace 文件列表");
+  }
+  return body;
+}
+
+export async function readWorkspaceFile(
+  workspaceId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceFileContent> {
+  const search = new URLSearchParams({ path });
+  const body = (await (
+    await apiRequest(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/files/content?${search}`,
+      signal ? { signal } : undefined,
+    )
+  ).json()) as unknown;
+  if (!Value.Check(WorkspaceFileContentSchema, body)) {
+    throw new Error("daemon 返回了无效的 Workspace 文件内容");
+  }
+  return body;
+}
+
+export async function selectWorkspaceDirectory(): Promise<ChatWorkspace | null> {
+  const response = await apiRequest("/api/workspaces", { method: "POST" });
+  if (response.status === 204) return null;
+  return readWorkspace((await response.json()) as unknown);
+}
+
+export async function removeWorkspace(workspaceId: string): Promise<void> {
+  await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: "DELETE" });
+}
+
+export async function reorderWorkspaces(
+  workspaceIds: readonly string[],
+): Promise<readonly ChatWorkspace[]> {
+  const response = await apiRequest("/api/workspaces/order", {
+    body: JSON.stringify({ workspaceIds }),
+    method: "PUT",
+  });
+  const body = (await response.json()) as unknown;
+  if (!Value.Check(WorkspaceListSchema, body)) {
+    throw new Error("daemon 返回了无效的 Workspace 列表");
+  }
+  return body.map(toChatWorkspace);
+}
+
+export async function revealWorkspace(workspaceId: string): Promise<void> {
+  await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/reveal`, { method: "POST" });
+}
+
+const OpenWorkspacePathResultSchema = Type.Object({
+  status: Type.Union([
+    Type.Literal(FileOpenResultStatus.APPLICATION_REQUIRED),
+    Type.Literal(FileOpenResultStatus.CANCELLED),
+    Type.Literal(FileOpenResultStatus.OPENED),
+  ]),
+});
+
+export type OpenWorkspacePathResult = Static<typeof OpenWorkspacePathResultSchema>;
+
+export async function openWorkspacePath(
+  workspaceId: string,
+  path: string,
+  rememberApplication?: boolean,
+): Promise<OpenWorkspacePathResult> {
+  const response = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/open`, {
+    body: JSON.stringify({
+      path,
+      ...(rememberApplication === undefined ? {} : { rememberApplication }),
+    }),
+    method: "POST",
+  });
+  const body = (await response.json()) as unknown;
+  if (!Value.Check(OpenWorkspacePathResultSchema, body)) {
+    throw new Error("daemon 返回了无效的文件打开结果");
+  }
+  return body;
+}
+
+export async function updateWorkspace(workspaceId: string, name: string): Promise<ChatWorkspace> {
+  const response = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}`, {
+    body: JSON.stringify({ name }),
+    method: "PATCH",
+  });
+  return readWorkspace((await response.json()) as unknown);
+}

@@ -1,0 +1,139 @@
+import type { Context, Message } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, getCurrentTools, normalizeContext } from "@earendil-works/pi-ai";
+import type { RunContextData, RunContextUsageData } from "../harness-event.js";
+
+const APPROXIMATE_ASCII_CHARS_PER_TOKEN = 3;
+const APPROXIMATE_IMAGE_TOKENS = 1_200;
+
+export interface ContextUsageEstimate {
+  conversationTokens: number;
+  contexts: RunContextUsageData[];
+  estimatedTotalTokens: number;
+  systemPromptTokens: number;
+  toolTokens: number;
+}
+
+function estimateTextTokens(text: string): number {
+  let asciiCharacters = 0;
+  let nonAsciiCharacters = 0;
+  for (const character of text) {
+    if ((character.codePointAt(0) ?? 0) <= 0x7f) asciiCharacters += 1;
+    else nonAsciiCharacters += 1;
+  }
+  return Math.ceil(asciiCharacters / APPROXIMATE_ASCII_CHARS_PER_TOKEN) + nonAsciiCharacters;
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "undefined";
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function estimateContentTokens(content: Message["content"]): number {
+  if (typeof content === "string") return estimateTextTokens(content);
+
+  let tokens = 0;
+  for (const block of content) {
+    if (block.type === "image") {
+      tokens += APPROXIMATE_IMAGE_TOKENS;
+    } else if (block.type === "text") {
+      tokens += estimateTextTokens(block.text);
+    }
+  }
+  return tokens;
+}
+
+export function estimateMessageTokens(message: Message): number {
+  if (message.role === "system" || message.role === "user" || message.role === "toolResult") {
+    return estimateContentTokens(message.content);
+  }
+
+  let tokens = 0;
+  for (const block of message.content) {
+    if (block.type === "text") {
+      tokens += estimateTextTokens(block.text);
+    } else if (block.type === "thinking") {
+      tokens += estimateTextTokens(block.thinking);
+    } else {
+      tokens += estimateTextTokens(block.name) + estimateTextTokens(safeStringify(block.arguments));
+    }
+  }
+  return tokens;
+}
+
+function estimateConversationTokens(messages: readonly Message[], prefixTokens: number): number {
+  let latestReliableUsage: { index: number; tokens: number } | null = null;
+  let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
+
+  for (const [index, message] of messages.entries()) {
+    if (
+      message.role === "assistant" &&
+      message.timestamp >= latestPrefixTimestamp &&
+      message.stopReason !== "aborted" &&
+      message.stopReason !== "error"
+    ) {
+      const tokens =
+        message.usage.totalTokens ||
+        message.usage.input +
+          message.usage.output +
+          message.usage.cacheRead +
+          message.usage.cacheWrite;
+      if (tokens > 0) latestReliableUsage = { index, tokens };
+    }
+    latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp);
+  }
+
+  if (latestReliableUsage === null) {
+    return messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
+  }
+
+  const trailingTokens = messages
+    .slice(latestReliableUsage.index + 1)
+    .reduce((total, message) => total + estimateMessageTokens(message), 0);
+  return Math.max(0, latestReliableUsage.tokens - prefixTokens) + trailingTokens;
+}
+
+/**
+ * 统计本次请求携带的完整 Session Context；messages 已包含按顺序累积的工具调用与结果。
+ * 这里只记录数量，不重复持久化 System Prompt、消息正文或工具参数 Schema。
+ */
+export function estimateContextUsage(
+  context: Context,
+  runContexts: readonly RunContextData[] = [],
+): ContextUsageEstimate {
+  const transcript = normalizeContext(context);
+  const tools = getCurrentTools(transcript.messages);
+  const totalSystemPromptTokens = estimateTextTokens(getCurrentSystemPrompt(transcript.messages));
+  let systemPromptTokens = totalSystemPromptTokens;
+  const contexts = runContexts.map(({ content, label, type }) => {
+    const tokens = Math.min(systemPromptTokens, estimateTextTokens(content));
+    systemPromptTokens -= tokens;
+    return { label, tokens, type };
+  });
+  const toolTokens = tools.length
+    ? estimateTextTokens(
+        safeStringify(
+          tools.map((tool) => ({
+            constrainedSampling: tool.constrainedSampling,
+            description: tool.description,
+            name: tool.name,
+            parameters: tool.parameters,
+          })),
+        ),
+      )
+    : 0;
+  const conversationTokens = estimateConversationTokens(
+    transcript.messages.filter((message) => message.role !== "system"),
+    totalSystemPromptTokens + toolTokens,
+  );
+
+  return {
+    conversationTokens,
+    contexts,
+    estimatedTotalTokens: totalSystemPromptTokens + toolTokens + conversationTokens,
+    systemPromptTokens,
+    toolTokens,
+  };
+}

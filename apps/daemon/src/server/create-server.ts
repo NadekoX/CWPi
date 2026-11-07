@@ -1,0 +1,301 @@
+import { randomBytes } from "node:crypto";
+import { join } from "node:path";
+import cors from "@fastify/cors";
+import fastifyStatic from "@fastify/static";
+import { AgentManager } from "@cwpi/agent-runtime";
+import { MemoryService } from "@cwpi/memory";
+import { ApprovalPolicy } from "@cwpi/policy";
+import { AVAILABLE_PLUGINS, resolveRegisteredPluginSkills } from "@cwpi/tools";
+import Fastify from "fastify";
+import { type HarnessConfig, loadHarnessConfig } from "../config/index.js";
+import { McpClientManager } from "../mcp/client-manager.js";
+import { McpDiscovery } from "../mcp/discovery.js";
+import { createMcpTransportFactory } from "../mcp/transports/factory.js";
+import { registerAppSettingsRoutes } from "../routes/app-settings-routes.js";
+import { registerBoardTaskRoutes } from "../routes/board-task-routes.js";
+import { registerDesktopRoutes } from "../routes/desktop-routes.js";
+import { registerHealthRoutes } from "../routes/health-routes.js";
+import { registerMcpRoutes } from "../routes/mcp-routes.js";
+import { registerMemoryRoutes } from "../routes/memory-routes.js";
+import { registerProviderRoutes } from "../routes/provider-routes.js";
+import { registerSessionRoutes } from "../routes/session-routes.js";
+import { registerSkillConnectionRoutes } from "../routes/skill-connection-routes.js";
+import { registerWorkspaceRoutes } from "../routes/workspace-routes.js";
+import { AppSettingsService } from "../services/app-settings-service.js";
+import { BoardTaskService } from "../services/board-task-service.js";
+import { ComputerUsePermissionService } from "../services/computer-use-permission-service.js";
+import { FileOpenService } from "../services/file-open-service.js";
+import { HumanInteractionService } from "../services/human-interaction-service.js";
+import { LocalMemoryEmbedder } from "../services/local-memory-embedder.js";
+import { McpDiagnosticsService } from "../services/mcp-diagnostics-service.js";
+import { McpOAuthService } from "../services/mcp-oauth-service.js";
+import { McpServerService } from "../services/mcp-server-service.js";
+import { McpToolService } from "../services/mcp-tool-service.js";
+import { ProviderService } from "../services/provider-service.js";
+import { SessionEventService } from "../services/session-event-service.js";
+import { SessionService } from "../services/session-service.js";
+import {
+  resolvePluginAppCredential,
+  SkillConnectionService,
+} from "../services/skill-connection-service.js";
+import { WorkspaceService } from "../services/workspace-service.js";
+import { SessionEventBroker } from "../sse/session-event-broker.js";
+import { AllowedCommandPrefixStore } from "../storage/allowed-command-prefix-store.js";
+import { openHarnessDatabase } from "../storage/database.js";
+import { McpCredentialStore } from "../storage/mcp-credential-store.js";
+import { FileCredentialStore } from "../storage/provider-credential-store.js";
+import { loadSandboxCredentials } from "../storage/sandbox-credential-store.js";
+import { SessionEventStore } from "../storage/session-event-store.js";
+import { SkillCredentialStore } from "../storage/skill-credential-store.js";
+import { isDesktopRequestAllowed } from "../utils/request-security.js";
+
+const LOCAL_WEB_ORIGINS = new Set(["http://127.0.0.1:5173", "http://localhost:5173"]);
+
+export async function createServer(config: HarnessConfig = loadHarnessConfig()) {
+  const server = Fastify({
+    logger: {
+      level: config.logLevel,
+    },
+  });
+  const database = openHarnessDatabase(config.databasePath);
+  const allowedCommandPrefixes = AllowedCommandPrefixStore.open(config.allowedCommandPrefixesPath);
+  const fileOpen = new FileOpenService(database.appSettings);
+  const computerUsePermissions = new ComputerUsePermissionService();
+  const credentials = await FileCredentialStore.open(config.credentialsPath);
+  const skillCredentials = await SkillCredentialStore.open(config.skillCredentialsPath);
+  const mcpCredentials = await McpCredentialStore.open(
+    join(config.globalRoot, "mcp-credentials.json"),
+  );
+  const protectedLocalPorts = [
+    config.port,
+    ...[config.webUrl, config.skillGatewayUrl].map((value) => {
+      const url = new URL(value);
+      return Number(url.port || (url.protocol === "https:" ? 443 : 80));
+    }),
+  ];
+  const protectedPaths = [config.globalRoot];
+  let mcpOAuth: McpOAuthService;
+  let skillConnections: SkillConnectionService | null = null;
+  const mcpClients = new McpClientManager(
+    createMcpTransportFactory(
+      (context) => mcpServers.verifyContext(context),
+      (context) => mcpOAuth.createAuthProvider(context),
+      protectedLocalPorts,
+      config.globalRoot,
+      protectedPaths,
+      () => database.appSettings.getApprovalPolicy() === ApprovalPolicy.FULL_ACCESS,
+    ),
+    (error) => server.log.warn({ code: error.code }, "MCP client lifecycle warning"),
+    (context) => mcpServers.verifyContext(context),
+  );
+  const mcpServers = new McpServerService(
+    database.mcpServers,
+    mcpCredentials,
+    (id) => mcpClients.invalidateServer(id),
+    (mcpServer) => resolvePluginAppCredential(mcpServer, skillCredentials),
+    async (mcpServer, signal) => {
+      await skillConnections?.refreshPluginAppCredential(mcpServer, signal);
+    },
+    async (mcpServer) =>
+      (await skillConnections?.invalidatePluginAppCredential(mcpServer)) ?? false,
+  );
+  const appSettings = new AppSettingsService(database.appSettings, config.globalRoot, () =>
+    mcpClients.invalidateAll(),
+  );
+  mcpOAuth = new McpOAuthService(config, mcpServers, protectedLocalPorts);
+  const mcpDiagnostics = new McpDiagnosticsService(mcpServers, mcpClients, new McpDiscovery());
+  const sandboxCredentials = await loadSandboxCredentials(config.sandboxCredentialsPath);
+  skillConnections = new SkillConnectionService(
+    skillCredentials,
+    database.appSettings,
+    config.skillGatewayUrl,
+    config.skillOAuthClients,
+    mcpServers,
+    (mcpServer) => {
+      void mcpClients
+        .invalidateServer(mcpServer.id)
+        .then(() =>
+          mcpDiagnostics.test(
+            mcpServer.id,
+            { expectedRevision: mcpServer.revision },
+            AbortSignal.timeout(30_000),
+          ),
+        )
+        .catch((error: unknown) => {
+          server.log.warn(
+            { err: error, serverId: mcpServer.id },
+            "Plugin app MCP catalog refresh failed",
+          );
+        });
+    },
+  );
+  await skillConnections.synchronizeApps();
+  const mcpWarmupController = new AbortController();
+  const mcpWarmup = mcpDiagnostics.initializeCatalogs(
+    mcpWarmupController.signal,
+    (serverId, error) => {
+      server.log.warn({ err: error, serverId }, "MCP catalog warmup failed");
+    },
+  );
+  const skillGatewayToken = randomBytes(32).toString("base64url");
+  const eventStore = new SessionEventStore(config.sessionsPath);
+  await eventStore.initialize();
+  const broker = new SessionEventBroker();
+  const boardTasks = new BoardTaskService(database.boardTasks, database.workspaces, eventStore);
+  const sessionEvents = new SessionEventService(database.sessions, eventStore, broker, boardTasks);
+  await sessionEvents.recoverInterruptedRuns();
+  const interactions = new HumanInteractionService();
+  const getRegisteredGlobalSkills = () =>
+    resolveRegisteredPluginSkills(
+      database.appSettings.getInstalledSkillCollectionIds(),
+      database.appSettings.getDisabledSkillCollectionSkillIds(),
+    );
+  const mcpTools = new McpToolService(
+    mcpServers,
+    mcpClients,
+    database.sessions,
+    database.appSettings,
+  );
+  let agents: AgentManager | undefined;
+  let sessions: SessionService | undefined;
+  const providers = await ProviderService.create(
+    database.providerSettings,
+    credentials,
+    (providerId) =>
+      (agents?.isProviderActive(providerId) ?? false) ||
+      (sessions?.isProviderActive(providerId) ?? false),
+  );
+  const localMemoryEmbedder = new LocalMemoryEmbedder(config.globalRoot);
+  const memories = new MemoryService(database.memories, {
+    modelId: localMemoryEmbedder.modelId,
+    embed: async (purpose, inputs, signal) => {
+      try {
+        return await localMemoryEmbedder.embed(purpose, inputs, signal);
+      } catch (error: unknown) {
+        server.log.warn({ err: error }, "Local memory embedding unavailable");
+        throw error;
+      }
+    },
+  });
+  agents = new AgentManager(
+    sessionEvents.handle,
+    interactions.requestApproval,
+    interactions.requestInput,
+    protectedPaths,
+    config.globalRoot,
+    config.webSearchUrl,
+    config.skillGatewayUrl,
+    skillGatewayToken,
+    getRegisteredGlobalSkills,
+    (directory) => !database.appSettings.getDisabledSkillDirectories().includes(directory),
+    () => allowedCommandPrefixes.getAll(),
+    () => sandboxCredentials,
+    memories,
+    mcpTools.prepare,
+    async (providerId, modelId) => (await providers.resolveRunModel(providerId, modelId)).model,
+    (error, context) =>
+      server.log.error({ err: error, ...context }, "Command process lifecycle failed"),
+    localMemoryEmbedder,
+  );
+  const workspaces = new WorkspaceService(
+    database.workspaces,
+    config.globalRoot,
+    database.appSettings,
+    fileOpen,
+    config.skillGatewayUrl,
+    getRegisteredGlobalSkills,
+  );
+  sessions = new SessionService(
+    database.sessions,
+    database.workspaces,
+    database.appSettings,
+    allowedCommandPrefixes,
+    eventStore,
+    sessionEvents,
+    boardTasks,
+    providers,
+    agents,
+    interactions,
+    (error, context) => {
+      server.log.error({ err: error, ...context }, "Session run failed outside Agent events");
+    },
+    protectedPaths,
+  );
+  await sessions.initializeSearchIndex();
+  const allowedHosts = new Set([
+    new URL(config.webUrl).host,
+    `${config.host}:${config.port}`,
+    new URL(config.skillGatewayUrl).host,
+    ...AVAILABLE_PLUGINS.flatMap(({ oauth }) =>
+      oauth?.callbackUrl === undefined ? [] : [new URL(oauth.callbackUrl).host],
+    ),
+    ...[...LOCAL_WEB_ORIGINS].map((origin) => new URL(origin).host),
+  ]);
+  server.addHook("onRequest", async (request, reply) => {
+    const host = request.headers.host;
+    if (host === undefined || !allowedHosts.has(host)) {
+      return reply.status(403).send({
+        code: "INVALID_REQUEST_HOST",
+        message: "The request host is not allowed",
+      });
+    }
+    if (!isDesktopRequestAllowed(config, request)) {
+      return reply.status(401).send({
+        code: "DESKTOP_AUTH_REQUIRED",
+        message: "Desktop authorization is required",
+      });
+    }
+  });
+
+  await server.register(cors, {
+    credentials: true,
+    origin(origin, callback) {
+      if (origin === undefined || origin === config.webUrl || LOCAL_WEB_ORIGINS.has(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error("Origin is not allowed"), false);
+    },
+  });
+
+  server.addHook("onClose", async () => {
+    mcpWarmupController.abort();
+    await mcpWarmup;
+    fileOpen.close();
+    workspaces.close();
+    await sessions.close();
+    await mcpServers.close();
+    await mcpClients.close();
+    await providers.close();
+    broker.clear();
+    database.close();
+  });
+
+  await registerAppSettingsRoutes(server, config, appSettings, fileOpen, computerUsePermissions);
+  await registerBoardTaskRoutes(server, config, boardTasks);
+  await registerHealthRoutes(server);
+  await registerMcpRoutes(server, config, mcpServers, mcpDiagnostics, mcpOAuth);
+  await registerMemoryRoutes(server, config, memories);
+  await registerProviderRoutes(server, config, providers);
+  await registerSessionRoutes(server, config, sessions, broker);
+  await registerSkillConnectionRoutes(server, config, skillConnections, skillGatewayToken);
+  await registerWorkspaceRoutes(server, config, workspaces);
+
+  if (config.webDistPath !== null) {
+    await registerDesktopRoutes(server, config);
+    await server.register(fastifyStatic, { root: config.webDistPath });
+    server.setNotFoundHandler((request, reply) => {
+      if (
+        request.method === "GET" &&
+        !request.url.startsWith("/api/") &&
+        request.headers.accept?.includes("text/html")
+      ) {
+        return reply.sendFile("index.html");
+      }
+      return reply.status(404).send({ code: "NOT_FOUND", message: "Route not found" });
+    });
+  }
+
+  return server;
+}

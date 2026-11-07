@@ -1,0 +1,206 @@
+import { ApprovalRequestKind, UserInputRequestKind } from "@cwpi/agent-runtime";
+import { ThinkingLevel } from "@cwpi/agent-runtime/thinking-level";
+import { type Static, Type } from "typebox";
+
+export const HarnessEventVoSchema = Type.Object({
+  data: Type.Unknown(),
+  id: Type.String({ minLength: 1 }),
+  runId: Type.Optional(Type.String({ minLength: 1 })),
+  seq: Type.Integer({ minimum: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  timestamp: Type.Integer({ minimum: 0 }),
+  type: Type.String({ minLength: 1 }),
+});
+
+export const SessionVoSchema = Type.Object({
+  createdAt: Type.Integer({ minimum: 0 }),
+  id: Type.String({ minLength: 1 }),
+  isRunning: Type.Optional(Type.Boolean()),
+  lastSeq: Type.Integer({ minimum: 0 }),
+  modelId: Type.String({ minLength: 1 }),
+  providerId: Type.String({ minLength: 1 }),
+  thinkingLevel: Type.Union([
+    Type.Literal(ThinkingLevel.OFF),
+    Type.Literal(ThinkingLevel.MINIMAL),
+    Type.Literal(ThinkingLevel.LOW),
+    Type.Literal(ThinkingLevel.MEDIUM),
+    Type.Literal(ThinkingLevel.HIGH),
+    Type.Literal(ThinkingLevel.XHIGH),
+    Type.Literal(ThinkingLevel.MAX),
+  ]),
+  title: Type.String({ minLength: 1 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+  workspaceId: Type.String({ minLength: 1 }),
+  workspaceRoot: Type.String({ minLength: 1 }),
+});
+
+export type SessionVo = Static<typeof SessionVoSchema>;
+
+export const SessionListVoSchema = Type.Array(SessionVoSchema);
+
+export const SessionUsageStatisticsVoSchema = Type.Array(
+  Type.Object({
+    date: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
+    providerId: Type.String({ minLength: 1 }),
+    modelId: Type.String({ minLength: 1 }),
+    requests: Type.Integer({ minimum: 0 }),
+    input: Type.Number({ minimum: 0 }),
+    output: Type.Number({ minimum: 0 }),
+    cacheRead: Type.Number({ minimum: 0 }),
+    cacheWrite: Type.Number({ minimum: 0 }),
+    reasoning: Type.Number({ minimum: 0 }),
+    totalTokens: Type.Number({ minimum: 0 }),
+    cost: Type.Number({ minimum: 0 }),
+  }),
+);
+
+export const SessionSearchResultVoSchema = Type.Object({
+  description: Type.String({ maxLength: 160 }),
+  excerpt: Type.String({ maxLength: 502 }),
+  messageEventId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+  session: SessionVoSchema,
+});
+
+export const SessionSearchResultListVoSchema = Type.Array(SessionSearchResultVoSchema);
+
+export type SessionSearchResultVo = Static<typeof SessionSearchResultVoSchema>;
+
+export const CommandProcessVoSchema = Type.Object({
+  command: Type.String(),
+  durationMs: Type.Number({ minimum: 0 }),
+  endedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+  exitCode: Type.Union([Type.Integer(), Type.Null()]),
+  output: Type.String(),
+  outputBytes: Type.Integer({ minimum: 0 }),
+  processId: Type.String({ format: "uuid" }),
+  runId: Type.String({ minLength: 1 }),
+  sandbox: Type.Union([Type.Literal("host"), Type.Literal("isolated")]),
+  sessionId: Type.String({ minLength: 1 }),
+  signal: Type.Union([Type.String(), Type.Null()]),
+  startedAt: Type.Integer({ minimum: 0 }),
+  status: Type.Union([
+    Type.Literal("running"),
+    Type.Literal("completed"),
+    Type.Literal("failed"),
+    Type.Literal("stopped"),
+    Type.Literal("timed_out"),
+    Type.Literal("aborted"),
+    Type.Literal("daemon_stopped"),
+  ]),
+  toolCallId: Type.String({ minLength: 1 }),
+  truncated: Type.Boolean(),
+});
+
+export const SessionSnapshotVoSchema = Type.Object({
+  commands: Type.Array(CommandProcessVoSchema),
+  events: Type.Array(HarnessEventVoSchema),
+  lastPersistedSeq: Type.Integer({ minimum: 0 }),
+  session: SessionVoSchema,
+});
+
+export type SessionSnapshotVo = Static<typeof SessionSnapshotVoSchema>;
+
+export const SubAgentEventsVoSchema = Type.Object({
+  events: Type.Array(HarnessEventVoSchema),
+  hasMore: Type.Boolean(),
+});
+export type SubAgentEventsVo = Static<typeof SubAgentEventsVoSchema>;
+
+export const RunAcceptedVoSchema = Type.Object({
+  runId: Type.String({ format: "uuid" }),
+  title: Type.String({ maxLength: 200, minLength: 1 }),
+});
+
+export type RunAcceptedVo = Static<typeof RunAcceptedVoSchema>;
+
+export const QueuedRunInputVoSchema = Type.Object({
+  attachments: Type.Array(
+    Type.Object({
+      contentIndex: Type.Optional(Type.Integer({ minimum: 0 })),
+      mimeType: Type.String(),
+      name: Type.String({ minLength: 1 }),
+      size: Type.Integer({ minimum: 0 }),
+    }),
+  ),
+  createdAt: Type.Integer({ minimum: 0 }),
+  id: Type.String({ format: "uuid" }),
+  prompt: Type.String(),
+  references: Type.Array(
+    Type.Object({
+      kind: Type.String({ minLength: 1 }),
+      path: Type.String({ minLength: 1 }),
+    }),
+  ),
+});
+
+export const QueuedRunInputListVoSchema = Type.Array(QueuedRunInputVoSchema);
+
+export type QueuedRunInputVo = Static<typeof QueuedRunInputVoSchema>;
+
+export const PendingToolApprovalVoSchema = Type.Object({
+  approvalId: Type.String({ format: "uuid" }),
+  allowSession: Type.Optional(Type.Boolean()),
+  allowSimilar: Type.Optional(Type.Boolean()),
+  kind: Type.Optional(
+    Type.Union([
+      Type.Literal(ApprovalRequestKind.TOOL),
+      Type.Literal(ApprovalRequestKind.HOST_EXECUTION),
+    ]),
+  ),
+  commandPrefix: Type.Optional(
+    Type.Array(Type.String({ maxLength: 256, minLength: 1 }), { maxItems: 16, minItems: 1 }),
+  ),
+  expiresAt: Type.Integer({ minimum: 0 }),
+  preview: Type.Optional(Type.String({ maxLength: 65_536, minLength: 1 })),
+  risk: Type.String({ minLength: 1 }),
+  runId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+  summary: Type.String({ minLength: 1 }),
+  target: Type.String({ minLength: 1 }),
+  toolCallId: Type.String({ minLength: 1 }),
+  toolName: Type.String({ minLength: 1 }),
+});
+
+export type PendingToolApprovalVo = Static<typeof PendingToolApprovalVoSchema>;
+
+export const PendingUserInputVoSchema = Type.Object({
+  expiresAt: Type.Integer({ minimum: 0 }),
+  inputId: Type.String({ format: "uuid" }),
+  kind: Type.Optional(
+    Type.Union([
+      Type.Literal(UserInputRequestKind.QUESTION),
+      Type.Literal(UserInputRequestKind.PLAN_REVIEW),
+    ]),
+  ),
+  planMarkdown: Type.Optional(Type.String({ maxLength: 100_000, minLength: 1 })),
+  questions: Type.Array(
+    Type.Object({
+      allowCustomInput: Type.Optional(Type.Boolean()),
+      multiSelect: Type.Optional(Type.Boolean()),
+      header: Type.String({ minLength: 1 }),
+      id: Type.String({ minLength: 1 }),
+      options: Type.Array(
+        Type.Object({
+          description: Type.Optional(Type.String()),
+          label: Type.String({ minLength: 1 }),
+        }),
+      ),
+      question: Type.String({ minLength: 1 }),
+    }),
+  ),
+  runId: Type.String({ format: "uuid" }),
+  sessionId: Type.String({ format: "uuid" }),
+});
+
+export type PendingUserInputVo = Static<typeof PendingUserInputVoSchema>;
+
+export const SessionFileChangesVoSchema = Type.Array(
+  Type.Object({
+    path: Type.String(),
+    status: Type.Union([Type.Literal("added"), Type.Literal("deleted"), Type.Literal("modified")]),
+    additions: Type.Optional(Type.Integer({ minimum: 0 })),
+    deletions: Type.Optional(Type.Integer({ minimum: 0 })),
+    before: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    after: Type.Optional(Type.String()),
+  }),
+);

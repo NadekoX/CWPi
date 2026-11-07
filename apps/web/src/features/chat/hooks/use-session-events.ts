@@ -1,0 +1,230 @@
+import { type HarnessEvent, HarnessEventType } from "@cwpi/agent-runtime/harness-event";
+import { isHarnessUserMessage, type QueuedRunInput } from "@cwpi/agent-runtime/user-input";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import {
+  parseSessionEvent,
+  type Session,
+  type SessionSnapshot,
+  sessionEventsUrl,
+} from "../api/session-api";
+import { sessionQueryKeys } from "../api/session-queries";
+import { useChatSidebarStore } from "../state/chat-sidebar-store";
+import { updateSnapshotWithEvents } from "../utils/session-snapshot";
+
+const RECONNECT_DELAY_MS = 2_000;
+const STREAM_FLUSH_INTERVAL_MS = 100;
+const TRACE_FLUSH_INTERVAL_MS = 500;
+const STALE_CONNECTION_TIMEOUT_MS = 45_000;
+const EVENT_TYPES = Object.values(HarnessEventType);
+const TRANSIENT_EVENT_TYPES = new Set<HarnessEvent["type"]>([
+  HarnessEventType.MESSAGE_DELTA,
+  HarnessEventType.TOOL_UPDATED,
+  HarnessEventType.COMMAND_UPDATED,
+  HarnessEventType.SUBAGENT_MESSAGE_DELTA,
+  HarnessEventType.SUBAGENT_TOOL_UPDATED,
+]);
+
+export function useSessionEvents(
+  sessionId: string,
+  initialSeq: number,
+  isRead: boolean,
+  isTrace = false,
+  isReady = true,
+  initialPersistedSeq = initialSeq,
+): void {
+  const queryClient = useQueryClient();
+  const lastSeqRef = useRef(initialSeq);
+  const lastPersistedSeqRef = useRef(initialPersistedSeq);
+  const sessionIdRef = useRef(sessionId);
+
+  useEffect(() => {
+    if (sessionIdRef.current !== sessionId) {
+      sessionIdRef.current = sessionId;
+      lastSeqRef.current = initialSeq;
+      lastPersistedSeqRef.current = initialPersistedSeq;
+      return;
+    }
+    lastSeqRef.current = Math.max(lastSeqRef.current, initialSeq);
+    lastPersistedSeqRef.current = Math.max(lastPersistedSeqRef.current, initialPersistedSeq);
+  }, [initialPersistedSeq, initialSeq, sessionId]);
+
+  useEffect(() => {
+    if (!isReady) return;
+    let source: EventSource | null = null;
+    let reconnectTimer: number | undefined;
+    let staleConnectionTimer: number | undefined;
+    let flushTimer: number | undefined;
+    let pendingEvents: HarnessEvent[] = [];
+    let isClosed = false;
+
+    const clearStaleConnectionTimer = () => {
+      if (staleConnectionTimer === undefined) return;
+      window.clearTimeout(staleConnectionTimer);
+      staleConnectionTimer = undefined;
+    };
+
+    const reconnect = () => {
+      source?.close();
+      source = null;
+      clearStaleConnectionTimer();
+      if (isClosed || reconnectTimer !== undefined) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined;
+        connect();
+      }, RECONNECT_DELAY_MS);
+    };
+
+    const markConnectionAlive = () => {
+      clearStaleConnectionTimer();
+      staleConnectionTimer = window.setTimeout(reconnect, STALE_CONNECTION_TIMEOUT_MS);
+    };
+
+    const commit = (events: readonly HarnessEvent[]) => {
+      if (events.length === 0) return;
+      const runStateEvent = events.findLast(
+        (event) =>
+          event.type === HarnessEventType.RUN_STARTED ||
+          event.type === HarnessEventType.RUN_COMPLETED ||
+          event.type === HarnessEventType.RUN_FAILED ||
+          event.type === HarnessEventType.RUN_ABORTED,
+      );
+      if (!isTrace && runStateEvent?.type === HarnessEventType.RUN_COMPLETED && !isRead) {
+        useChatSidebarStore.getState().markSessionCompleted(sessionId);
+      }
+      lastSeqRef.current = Math.max(lastSeqRef.current, events.at(-1)?.seq ?? 0);
+      for (const event of events) {
+        if (!TRANSIENT_EVENT_TYPES.has(event.type)) {
+          lastPersistedSeqRef.current = Math.max(lastPersistedSeqRef.current, event.seq);
+        }
+      }
+      queryClient.setQueryData<SessionSnapshot>(
+        isTrace ? sessionQueryKeys.trace(sessionId) : sessionQueryKeys.detail(sessionId),
+        (snapshot) => (snapshot ? updateSnapshotWithEvents(snapshot, events) : snapshot),
+      );
+      if (
+        !isTrace &&
+        events.some(
+          (event) =>
+            event.type !== HarnessEventType.MESSAGE_DELTA &&
+            event.type !== HarnessEventType.TOOL_UPDATED &&
+            event.type !== HarnessEventType.COMMAND_UPDATED &&
+            event.type !== HarnessEventType.SUBAGENT_MESSAGE_DELTA &&
+            event.type !== HarnessEventType.SUBAGENT_TOOL_UPDATED,
+        )
+      ) {
+        queryClient.setQueryData<readonly Session[]>(sessionQueryKeys.list(), (sessions) =>
+          sessions?.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  ...(runStateEvent === undefined
+                    ? {}
+                    : { isRunning: runStateEvent.type === HarnessEventType.RUN_STARTED }),
+                  lastSeq: lastSeqRef.current,
+                  updatedAt: Math.max(session.updatedAt, events.at(-1)?.timestamp ?? 0),
+                }
+              : session,
+          ),
+        );
+      }
+      for (const event of events) {
+        if (
+          (event.type !== HarnessEventType.MESSAGE_STARTED &&
+            event.type !== HarnessEventType.MESSAGE_COMPLETED) ||
+          event.runId === undefined ||
+          !isHarnessUserMessage(event.data) ||
+          event.data.queuedInputId === undefined
+        ) {
+          continue;
+        }
+        const queuedInputId = event.data.queuedInputId;
+        queryClient.setQueryData<readonly QueuedRunInput[]>(
+          sessionQueryKeys.queuedInputs(sessionId, event.runId),
+          (items) => items?.filter((item) => item.id !== queuedInputId),
+        );
+      }
+    };
+
+    const invalidateSnapshots = () => {
+      void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.detail(sessionId) });
+      void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.trace(sessionId) });
+    };
+
+    const flush = () => {
+      if (flushTimer !== undefined) window.clearTimeout(flushTimer);
+      flushTimer = undefined;
+      const events = pendingEvents;
+      pendingEvents = [];
+      try {
+        commit(events);
+      } catch {
+        invalidateSnapshots();
+      }
+    };
+
+    const receive = (message: MessageEvent<string>) => {
+      if (isClosed) return;
+      markConnectionAlive();
+      try {
+        const event = parseSessionEvent(message.data);
+        const lastReceivedSeq = Math.max(lastSeqRef.current, pendingEvents.at(-1)?.seq ?? 0);
+        if (event.sessionId !== sessionId || event.seq <= lastReceivedSeq) return;
+        // Trace uses completed model messages; token deltas do not change any trace record.
+        if (
+          isTrace &&
+          (event.type === HarnessEventType.MESSAGE_DELTA ||
+            event.type === HarnessEventType.SUBAGENT_MESSAGE_DELTA)
+        ) {
+          lastSeqRef.current = event.seq;
+          return;
+        }
+        pendingEvents.push(event);
+        if (event.type === HarnessEventType.MESSAGE_DELTA) {
+          flush();
+          return;
+        }
+        if (
+          event.type === HarnessEventType.TOOL_UPDATED ||
+          event.type === HarnessEventType.COMMAND_UPDATED ||
+          event.type === HarnessEventType.SUBAGENT_MESSAGE_DELTA ||
+          event.type === HarnessEventType.SUBAGENT_TOOL_UPDATED
+        ) {
+          flushTimer ??= window.setTimeout(
+            flush,
+            isTrace ? TRACE_FLUSH_INTERVAL_MS : STREAM_FLUSH_INTERVAL_MS,
+          );
+        } else {
+          // 状态事件与此前的增量一起提交，保持审批、完成和中止即时且有序。
+          flush();
+        }
+      } catch {
+        flush();
+        invalidateSnapshots();
+      }
+    };
+
+    const connect = () => {
+      if (isClosed) return;
+      const nextSource = new EventSource(
+        sessionEventsUrl(sessionId, lastPersistedSeqRef.current, isTrace),
+      );
+      source = nextSource;
+      for (const type of EVENT_TYPES) nextSource.addEventListener(type, receive as EventListener);
+      nextSource.onmessage = markConnectionAlive;
+      nextSource.onopen = markConnectionAlive;
+      nextSource.onerror = () => {
+        if (source === nextSource) reconnect();
+      };
+    };
+
+    connect();
+    return () => {
+      isClosed = true;
+      source?.close();
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      clearStaleConnectionTimer();
+      flush();
+    };
+  }, [isRead, isTrace, isReady, queryClient, sessionId]);
+}

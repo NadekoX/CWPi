@@ -1,0 +1,42 @@
+{
+  "name": "@cwpi/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./session-event-store": "./src/storage/session-event-store.ts"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "node --watch --import tsx --env-file-if-exists=../../.env src/dev.ts",
+    "start": "node --import tsx --env-file-if-exists=../../.env dist/bootstrap.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "catalog:",
+    "@fastify/cors": "catalog:",
+    "@fastify/static": "catalog:",
+    "@huggingface/transformers": "catalog:",
+    "@cwpi/agent-runtime": "workspace:*",
+    "@cwpi/computer-use": "workspace:*",
+    "@cwpi/memory": "workspace:*",
+    "@cwpi/policy": "workspace:*",
+    "@cwpi/providers": "workspace:*",
+    "@cwpi/sandbox": "workspace:*",
+    "@cwpi/tools": "workspace:*",
+    "es-toolkit": "catalog:",
+    "fastify": "catalog:",
+    "pino": "catalog:",
+    "skills": "catalog:",
+    "tsx": "catalog:",
+    "typebox": "catalog:",
+    "diff": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
+  }
+}

@@ -1,0 +1,39 @@
+id: github
+displayName: GitHub
+apiUrl: https://api.github.com
+description: Search repositories, review pull requests, manage issues, and diagnose Actions.
+category: developer
+type: oauth
+gateway:
+  allowedPaths:
+    - '^/user(?:/repos)?/?$'
+    - '^/users/[^/]+(?:/repos)?/?$'
+    - '^/search/(?:repositories|issues|users|code|commits|topics|labels)/?$'
+    - '^/repos/[^/]+/[^/]+(?:/.*)?$'
+  headers:
+    Accept: application/vnd.github+json
+oauth:
+  authorizationPath: https://github.com/login/oauth/authorize
+  tokenPath: https://github.com/login/oauth/access_token
+  clientId: ''
+  clientSecret: ''
+  pkce: true
+  tokenAuth: body
+  tokenFormat: form
+  scopes: [repo, user]
+  profile:
+    source: userinfo
+    path: /user
+    idField: id
+    usernameField: login
+    displayNameField: name
+    avatarUrlField: avatar_url
+skills:
+  - id: github
+    displayName: GitHub 工作流
+  - id: gh-address-comments
+    displayName: 处理审查意见
+  - id: gh-fix-ci
+    displayName: 修复 Actions 检查
+  - id: yeet
+    displayName: 提交与草稿 PR

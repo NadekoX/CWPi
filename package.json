@@ -1,0 +1,36 @@
+{
+  "name": "cwpi",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "env:encrypt": "node scripts/env-crypt.mjs encrypt",
+    "env:decrypt": "node scripts/env-crypt.mjs decrypt",
+    "env:check": "node scripts/env-crypt.mjs check",
+    "dev": "pnpm --parallel --filter @cwpi/daemon --filter @cwpi/web dev",
+    "dev:daemon": "pnpm --filter @cwpi/daemon dev",
+    "dev:desktop": "pnpm --filter @cwpi/desktop tauri dev",
+    "dev:web": "pnpm --filter @cwpi/web dev",
+    "start": "pnpm --parallel --filter @cwpi/daemon --filter @cwpi/web start",
+    "build:desktop": "pnpm --filter @cwpi/desktop desktop:build",
+    "release:desktop": "pnpm --filter @cwpi/desktop desktop:release",
+    "eval:context": "pnpm --filter @cwpi/evals eval:context",
+    "eval:context:live": "pnpm --filter @cwpi/evals eval:context:live",
+    "dev:docker": "docker compose -f docker-compose.dev.yml up -d",
+    "dev:mcp": "npx @modelcontextprotocol/inspector",
+    "build": "pnpm --filter @cwpi/daemon build && pnpm --filter @cwpi/web build",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "check": "biome check .",
+    "check:write": "biome check --write .",
+    "format": "biome format --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "catalog:",
+    "typescript": "catalog:"
+  }
+}

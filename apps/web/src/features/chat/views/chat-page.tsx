@@ -1,0 +1,774 @@
+"use client";
+
+import { ChatConversation, ChatMessage as ChatMessagePrimitive } from "@agile-avocation/ui-pro";
+import { Skeleton } from "@heroui/react";
+import type { ApprovalResponseDecision } from "@cwpi/agent-runtime/harness-event";
+import {
+  HarnessEventType,
+  selectActiveSessionEvents,
+} from "@cwpi/agent-runtime/harness-event";
+import type { ThinkingLevel } from "@cwpi/agent-runtime/thinking-level";
+import type { RunUserInput, UserInputSubmission } from "@cwpi/agent-runtime/user-input";
+import { BusySubmitBehavior, type QueuedRunInput } from "@cwpi/agent-runtime/user-input";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  abortSessionRun,
+  abortSubAgent,
+  followUpSessionRun,
+  removeQueuedSessionRunInput,
+  resolveToolApproval,
+  resolveUserInput,
+  retrySessionUserMessage,
+  type Session,
+  type SessionSnapshot,
+  type SessionSnapshotEventMetadata,
+  startSessionRun,
+  steerQueuedSessionRunInput,
+  steerSessionRun,
+  updateQueuedSessionRunInput,
+  updateSessionModel,
+} from "../api/session-api";
+import {
+  queuedSessionRunInputsQueryOptions,
+  sessionQueryKeys,
+  sessionSnapshotQueryOptions,
+} from "../api/session-queries";
+import { ChatComposer, type ChatComposerProps } from "../components/chat-composer";
+import { ChatNavbarActions } from "../components/chat-navbar-actions";
+import { ChatTraceView } from "../components/chat-trace-view";
+import { CommandTasksPopover } from "../components/command-tasks-popover";
+import { ConversationTurnToc } from "../components/conversation-turn-toc";
+import { ThreadMessageList, type ThreadMessageListHandle } from "../components/thread-message-list";
+import { ToolApprovalCard } from "../components/tool-approval-card";
+import { UserInputCard } from "../components/user-input-card";
+import { WorkingStatePanel } from "../components/working-state-panel";
+import { WorkspaceFilesView } from "../components/workspace-files-view";
+import { ChatPageView } from "../constants/chat-page-view";
+import { CHAT_AUTO_SCROLL_THRESHOLD_PX } from "../constants/chat-scroll";
+import { type ChatMessage, ChatMessageType } from "../data/chat";
+import { useSessionEvents } from "../hooks/use-session-events";
+import { useChatPageViewStore } from "../state/chat-page-view-store";
+import { useChatSearchTargetStore } from "../state/chat-search-target-store";
+import {
+  findActiveRunId,
+  optimisticUserInputToMessage,
+  sessionEventsToMessages,
+} from "../utils/session-messages";
+import {
+  clearOptimisticUserInput,
+  selectSessionEventCursor,
+  selectSessionEventMetadata,
+  stageOptimisticUserInput,
+} from "../utils/session-snapshot";
+import { summarizeSessionUsage } from "../utils/session-usage";
+import { findPendingUserInput } from "../utils/session-user-input";
+import { readSessionWorkingState } from "../utils/session-working-state";
+
+const CHAT_VIEW_TRANSITION = {
+  duration: 0.18,
+  ease: [0.22, 1, 0.36, 1],
+} as const;
+const EMPTY_SESSION_EVENTS = [] as const;
+const EMPTY_QUEUED_INPUTS: readonly QueuedRunInput[] = [];
+const EMPTY_SESSION_EVENT_METADATA: SessionSnapshotEventMetadata = {
+  changedRunIds: new Set(),
+  stableEvents: EMPTY_SESSION_EVENTS,
+  transientByKey: new Map(),
+};
+
+export interface ChatPageProps {
+  sessionId: string;
+}
+
+export function ChatPageSkeleton() {
+  const shouldReduceMotion = useReducedMotion();
+
+  return (
+    <div
+      aria-busy
+      className={`relative z-30 flex h-[calc(100svh-var(--chat-navbar-height,64px))] flex-col overflow-hidden bg-background ${
+        shouldReduceMotion ? "" : "skeleton--shimmer"
+      }`}
+      role="status"
+    >
+      <span className="sr-only">正在加载会话</span>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        <div className="mx-auto flex w-full max-w-[714px] flex-col gap-2 px-4 pt-10 pb-12">
+          <ChatMessagePrimitive.User>
+            <ChatMessagePrimitive.Bubble className="w-[min(72%,26rem)]">
+              <ChatMessagePrimitive.Content>
+                <Skeleton animationType="none" aria-hidden className="h-4 w-full rounded-full" />
+              </ChatMessagePrimitive.Content>
+            </ChatMessagePrimitive.Bubble>
+          </ChatMessagePrimitive.User>
+
+          <div className="mt-6">
+            <ChatMessagePrimitive.Assistant>
+              <ChatMessagePrimitive.Body>
+                <ChatMessagePrimitive.Content className="flex flex-col gap-3 py-1">
+                  <Skeleton animationType="none" aria-hidden className="h-4 w-full rounded-full" />
+                  <Skeleton animationType="none" aria-hidden className="h-4 w-[82%] rounded-full" />
+                  <Skeleton animationType="none" aria-hidden className="h-4 w-[58%] rounded-full" />
+                </ChatMessagePrimitive.Content>
+              </ChatMessagePrimitive.Body>
+            </ChatMessagePrimitive.Assistant>
+          </div>
+        </div>
+      </div>
+
+      <div className="relative z-10 shrink-0 bg-background px-4 pb-2">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-x-0 bottom-full h-16 bg-linear-to-b from-transparent to-background"
+        />
+        <div className="mx-auto w-full max-w-[714px]">
+          <div className="flex min-h-[120px] flex-col justify-between rounded-[32px] bg-field p-4 shadow-field">
+            <Skeleton animationType="none" aria-hidden className="h-4 w-44 rounded-full" />
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <Skeleton animationType="none" aria-hidden className="size-8 rounded-full" />
+                <Skeleton
+                  animationType="none"
+                  aria-hidden
+                  className="h-8 w-24 rounded-full sm:w-32"
+                />
+                <Skeleton
+                  animationType="none"
+                  aria-hidden
+                  className="hidden h-8 w-36 rounded-full sm:block"
+                />
+              </div>
+              <Skeleton animationType="none" aria-hidden className="size-8 shrink-0 rounded-full" />
+            </div>
+          </div>
+          <Skeleton
+            animationType="none"
+            aria-hidden
+            className="mx-auto mt-3 h-3 w-48 rounded-full"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function ChatPage({ sessionId }: ChatPageProps) {
+  const queryClient = useQueryClient();
+  const activeView = useChatPageViewStore((state) => state.activeView);
+  const snapshotQuery = useQuery(sessionSnapshotQueryOptions(sessionId));
+  const snapshot = snapshotQuery.data;
+  const isSnapshotReady = snapshot !== undefined;
+  useSessionEvents(
+    sessionId,
+    snapshot ? selectSessionEventCursor(snapshot) : 0,
+    true,
+    false,
+    isSnapshotReady,
+    snapshot?.lastPersistedSeq ?? 0,
+  );
+  const clearSearchTarget = useChatSearchTargetStore((state) => state.clearTarget);
+  const searchTarget = useChatSearchTargetStore((state) =>
+    state.target?.sessionId === sessionId ? state.target : null,
+  );
+  const shouldReduceMotion = useReducedMotion();
+  const transition = shouldReduceMotion ? { duration: 0 } : CHAT_VIEW_TRANSITION;
+  const eventMetadata = snapshot
+    ? selectSessionEventMetadata(snapshot)
+    : EMPTY_SESSION_EVENT_METADATA;
+  const events = eventMetadata.stableEvents;
+  const stateEvents = eventMetadata.stableEvents;
+  const activeEvents = useMemo(() => selectActiveSessionEvents(stateEvents), [stateEvents]);
+  const projectedMessages = useMemo(() => sessionEventsToMessages(eventMetadata), [eventMetadata]);
+  const messages = useMemo(() => {
+    if (!snapshot?.optimisticUserInputs?.length) return projectedMessages;
+    const optimisticMessages = snapshot.optimisticUserInputs.map(optimisticUserInputToMessage);
+    const loadingIndex = projectedMessages.findLastIndex(
+      (message) => message.type === ChatMessageType.LOADING,
+    );
+    if (loadingIndex >= 0) {
+      return [
+        ...projectedMessages.slice(0, loadingIndex),
+        ...optimisticMessages,
+        ...projectedMessages.slice(loadingIndex),
+      ];
+    }
+    const latestOptimisticInput = snapshot.optimisticUserInputs.at(-1);
+    const loadingMessage = {
+      id: `loading-${latestOptimisticInput?.id ?? sessionId}`,
+      label: "正在处理…",
+      type: ChatMessageType.LOADING,
+    } satisfies ChatMessage;
+    return [...projectedMessages, ...optimisticMessages, loadingMessage];
+  }, [projectedMessages, sessionId, snapshot?.optimisticUserInputs]);
+  const lastConversationTurnId = messages.findLast(
+    (message) => message.type === ChatMessageType.USER,
+  )?.id;
+  const usage = useMemo(() => summarizeSessionUsage(activeEvents), [activeEvents]);
+  const workingState = useMemo(() => readSessionWorkingState(activeEvents), [activeEvents]);
+  const eventActiveRunId = useMemo(() => findActiveRunId(activeEvents), [activeEvents]);
+  const pendingApprovalTool = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      const tool =
+        message?.type === ChatMessageType.TOOL
+          ? message.tool
+          : message?.type === ChatMessageType.TOOL_GROUP
+            ? message.tools.findLast((item) => item.approval !== undefined)
+            : undefined;
+      if (tool?.approval) return tool;
+    }
+    return undefined;
+  }, [messages]);
+  const pendingApproval = pendingApprovalTool?.approval;
+  const pendingUserInput = useMemo(() => findPendingUserInput(activeEvents), [activeEvents]);
+  const pendingInputAgent = pendingUserInput?.executionId
+    ? messages.find(
+        (message) =>
+          message.type === ChatMessageType.SUBAGENT &&
+          message.executionId === pendingUserInput.executionId,
+      )
+    : undefined;
+  const pendingInputAgentName =
+    pendingInputAgent?.type === ChatMessageType.SUBAGENT ? pendingInputAgent.name : undefined;
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const [conversationElement, setConversationElement] = useState<HTMLDivElement | null>(null);
+  const conversationContentRef = useRef<HTMLDivElement>(null);
+  const messageListRef = useRef<ThreadMessageListHandle>(null);
+  const shouldFollowConversationRef = useRef(true);
+  const conversationScrollPositionRef = useRef<{
+    isAtBottom: boolean;
+    scrollTop: number;
+    sessionId: string;
+  } | null>(null);
+  const [activeConversationTurn, setActiveConversationTurn] = useState<{
+    sessionId: string;
+    turnId: string;
+  } | null>(null);
+  const [positionedSessionId, setPositionedSessionId] = useState<string | null>(null);
+  const [acceptedRun, setAcceptedRun] = useState<{ runId: string; sessionId: string } | null>(null);
+  const isPageReady =
+    activeView !== ChatPageView.CONVERSATION ||
+    searchTarget !== null ||
+    positionedSessionId === sessionId;
+  const stopFollowingConversation = useCallback(() => {
+    shouldFollowConversationRef.current = false;
+  }, []);
+  const handleConversationRef = useCallback((element: HTMLDivElement | null) => {
+    conversationRef.current = element;
+    setConversationElement(element);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!isSnapshotReady || activeView !== ChatPageView.CONVERSATION) return;
+    const conversation = conversationElement;
+    const content = conversationContentRef.current;
+    if (!conversation || !content) return;
+
+    let frameId = 0;
+    let observer: ResizeObserver | undefined;
+    const savedPosition = conversationScrollPositionRef.current;
+    const positionAtEnd = () => {
+      if (!shouldFollowConversationRef.current) return;
+      conversation.scrollTop = conversation.scrollHeight;
+      window.cancelAnimationFrame(frameId);
+      frameId = window.requestAnimationFrame(() => {
+        if (!shouldFollowConversationRef.current) return;
+        conversation.scrollTop = conversation.scrollHeight;
+        const isAtBottom =
+          conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight <= 1;
+        if (isAtBottom) {
+          setPositionedSessionId(sessionId);
+        }
+      });
+    };
+
+    if (savedPosition?.sessionId === sessionId && !savedPosition.isAtBottom) {
+      shouldFollowConversationRef.current = false;
+      const restorePosition = () => {
+        conversation.scrollTop = savedPosition.scrollTop;
+        setPositionedSessionId(sessionId);
+      };
+      restorePosition();
+      frameId = window.requestAnimationFrame(restorePosition);
+    } else {
+      shouldFollowConversationRef.current = true;
+      positionAtEnd();
+    }
+    observer = new ResizeObserver(positionAtEnd);
+    observer.observe(content);
+    return () => {
+      observer?.disconnect();
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [activeView, conversationElement, isSnapshotReady, sessionId]);
+
+  useLayoutEffect(() => {
+    if (
+      activeView === ChatPageView.CONVERSATION &&
+      isSnapshotReady &&
+      shouldFollowConversationRef.current
+    ) {
+      if (conversationRef.current) {
+        conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+      }
+    }
+  }, [activeView, isSnapshotReady, messages]);
+
+  const startMutation = useMutation({
+    mutationFn: ({ input, sessionId }: { input: RunUserInput; sessionId: string }) =>
+      startSessionRun(sessionId, input),
+    onError: (_error, { input, sessionId }) => {
+      queryClient.setQueryData<SessionSnapshot>(sessionQueryKeys.detail(sessionId), (snapshot) =>
+        snapshot ? clearOptimisticUserInput(snapshot, input) : snapshot,
+      );
+      void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.list() });
+    },
+    onMutate: ({ input, sessionId }) => {
+      setAcceptedRun(null);
+      queryClient.setQueryData<SessionSnapshot>(sessionQueryKeys.detail(sessionId), (snapshot) =>
+        snapshot ? stageOptimisticUserInput(snapshot, input) : snapshot,
+      );
+      queryClient.setQueryData<readonly Session[]>(sessionQueryKeys.list(), (sessions) =>
+        sessions?.map((session) =>
+          session.id === sessionId ? { ...session, isRunning: true } : session,
+        ),
+      );
+    },
+    onSuccess: (accepted, { sessionId }) => setAcceptedRun({ runId: accepted.runId, sessionId }),
+  });
+  const abortMutation = useMutation({
+    mutationFn: (runId: string) => abortSessionRun(sessionId, runId),
+  });
+  const retryMutation = useMutation({
+    mutationFn: ({
+      messageEventId,
+      prompt,
+      sessionId,
+    }: {
+      messageEventId: string;
+      prompt: string;
+      sessionId: string;
+    }) => retrySessionUserMessage(sessionId, messageEventId, prompt),
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.list() });
+    },
+    onMutate: ({ sessionId }) => {
+      setAcceptedRun(null);
+      queryClient.setQueryData<readonly Session[]>(sessionQueryKeys.list(), (sessions) =>
+        sessions?.map((session) =>
+          session.id === sessionId ? { ...session, isRunning: true } : session,
+        ),
+      );
+    },
+    onSuccess: (accepted, { sessionId }) => setAcceptedRun({ runId: accepted.runId, sessionId }),
+  });
+  const followUpMutation = useMutation({
+    mutationFn: ({ input, runId }: { input: RunUserInput; runId: string }) =>
+      followUpSessionRun(sessionId, runId, input),
+    onSuccess: (_, { runId }) =>
+      queryClient.invalidateQueries({
+        queryKey: sessionQueryKeys.queuedInputs(sessionId, runId),
+      }),
+  });
+  const steerMutation = useMutation({
+    mutationFn: ({ input, runId }: { input: RunUserInput; runId: string }) =>
+      steerSessionRun(sessionId, runId, input),
+    onError: (_error, { input }) => {
+      queryClient.setQueryData<SessionSnapshot>(sessionQueryKeys.detail(sessionId), (snapshot) =>
+        snapshot ? clearOptimisticUserInput(snapshot, input) : snapshot,
+      );
+    },
+    onMutate: ({ input }) => {
+      queryClient.setQueryData<SessionSnapshot>(sessionQueryKeys.detail(sessionId), (snapshot) =>
+        snapshot ? stageOptimisticUserInput(snapshot, input) : snapshot,
+      );
+    },
+  });
+  const updateQueuedInputMutation = useMutation({
+    mutationFn: ({
+      prompt,
+      queuedInputId,
+      runId,
+    }: {
+      prompt: string;
+      queuedInputId: string;
+      runId: string;
+    }) => updateQueuedSessionRunInput(sessionId, runId, queuedInputId, prompt),
+    onSuccess: (updated, { runId }) => {
+      queryClient.setQueryData<readonly QueuedRunInput[]>(
+        sessionQueryKeys.queuedInputs(sessionId, runId),
+        (items) => items?.map((item) => (item.id === updated.id ? updated : item)),
+      );
+    },
+  });
+  const removeQueuedInputMutation = useMutation({
+    mutationFn: ({ queuedInputId, runId }: { queuedInputId: string; runId: string }) =>
+      removeQueuedSessionRunInput(sessionId, runId, queuedInputId),
+    onSuccess: (_, { queuedInputId, runId }) => {
+      queryClient.setQueryData<readonly QueuedRunInput[]>(
+        sessionQueryKeys.queuedInputs(sessionId, runId),
+        (items) => items?.filter((item) => item.id !== queuedInputId),
+      );
+    },
+  });
+  const steerQueuedInputMutation = useMutation({
+    mutationFn: ({ queuedInputId, runId }: { queuedInputId: string; runId: string }) =>
+      steerQueuedSessionRunInput(sessionId, runId, queuedInputId),
+    onSuccess: (_, { queuedInputId, runId }) => {
+      queryClient.setQueryData<readonly QueuedRunInput[]>(
+        sessionQueryKeys.queuedInputs(sessionId, runId),
+        (items) => items?.filter((item) => item.id !== queuedInputId),
+      );
+    },
+  });
+  const cacheSession = (session: Session) => {
+    queryClient.setQueryData<SessionSnapshot>(sessionQueryKeys.detail(sessionId), (current) =>
+      current ? { ...current, session } : current,
+    );
+    queryClient.setQueryData<SessionSnapshot>(sessionQueryKeys.trace(sessionId), (current) =>
+      current ? { ...current, session } : current,
+    );
+    queryClient.setQueryData<readonly Session[]>(sessionQueryKeys.list(), (sessions) =>
+      sessions?.map((item) =>
+        item.id === session.id
+          ? { ...session, ...(item.isRunning === undefined ? {} : { isRunning: item.isRunning }) }
+          : item,
+      ),
+    );
+  };
+  const modelMutation = useMutation({
+    mutationFn: ({
+      modelId,
+      providerId,
+      thinkingLevel,
+    }: {
+      modelId: string;
+      providerId: string;
+      thinkingLevel: ThinkingLevel;
+    }) => updateSessionModel(sessionId, providerId, modelId, thinkingLevel),
+    onSuccess: cacheSession,
+  });
+  const approvalMutation = useMutation({
+    mutationFn: ({
+      approvalId,
+      decision,
+      runId,
+    }: {
+      approvalId: string;
+      decision: ApprovalResponseDecision;
+      runId: string;
+    }) => resolveToolApproval(sessionId, runId, approvalId, decision),
+  });
+  const inputMutation = useMutation({
+    mutationFn: ({
+      inputId,
+      runId,
+      submission,
+    }: {
+      inputId: string;
+      runId: string;
+      submission: UserInputSubmission;
+    }) => resolveUserInput(sessionId, runId, inputId, submission),
+  });
+
+  const acceptedRunId = acceptedRun?.sessionId === sessionId ? acceptedRun.runId : null;
+  const isAcceptedRunFinished = useMemo(
+    () =>
+      acceptedRunId !== null &&
+      events.some(
+        (event) =>
+          event.runId === acceptedRunId &&
+          (event.type === HarnessEventType.RUN_ABORTED ||
+            event.type === HarnessEventType.RUN_COMPLETED ||
+            event.type === HarnessEventType.RUN_FAILED),
+      ),
+    [acceptedRunId, events],
+  );
+  const acceptedRunIdWhileStarting = isAcceptedRunFinished ? null : acceptedRunId;
+  const activeRunId = eventActiveRunId ?? acceptedRunIdWhileStarting;
+  const queuedInputsQuery = useQuery({
+    ...queuedSessionRunInputsQueryOptions(sessionId, activeRunId ?? "inactive"),
+    enabled: activeRunId !== null,
+  });
+  const status =
+    (startMutation.isPending && startMutation.variables.sessionId === sessionId) ||
+    (retryMutation.isPending && retryMutation.variables.sessionId === sessionId) ||
+    (activeRunId && eventActiveRunId === null) ||
+    (snapshot?.optimisticUserInputs?.length && eventActiveRunId === null)
+      ? "submitted"
+      : eventActiveRunId === null
+        ? "ready"
+        : "streaming";
+  const isSessionRunning = status !== "ready";
+  const composerActions = useMemo<
+    Pick<
+      ChatComposerProps,
+      | "onModelChange"
+      | "onStopRun"
+      | "onRemoveQueuedInput"
+      | "onSteerQueuedInput"
+      | "onSubmitMessage"
+      | "onUpdateQueuedInput"
+    >
+  >(
+    () => ({
+      onModelChange: (selection) => modelMutation.mutateAsync(selection).then(() => undefined),
+      onStopRun: () =>
+        activeRunId
+          ? abortMutation.mutateAsync(activeRunId)
+          : Promise.reject(new Error("活动 Run 不存在")),
+      onRemoveQueuedInput: (queuedInputId) =>
+        activeRunId
+          ? removeQueuedInputMutation.mutateAsync({ queuedInputId, runId: activeRunId })
+          : Promise.reject(new Error("活动 Run 不存在")),
+      onSteerQueuedInput: (queuedInputId) =>
+        activeRunId
+          ? steerQueuedInputMutation.mutateAsync({ queuedInputId, runId: activeRunId })
+          : Promise.reject(new Error("活动 Run 不存在")),
+      onSubmitMessage: ({ busySubmitBehavior, ...input }) => {
+        if (!activeRunId) {
+          return startMutation.mutateAsync({ input, sessionId }).then(() => undefined);
+        }
+        return busySubmitBehavior === BusySubmitBehavior.STEER
+          ? steerMutation.mutateAsync({ input, runId: activeRunId })
+          : followUpMutation.mutateAsync({ input, runId: activeRunId }).then(() => undefined);
+      },
+      onUpdateQueuedInput: (queuedInputId, prompt) =>
+        activeRunId
+          ? updateQueuedInputMutation
+              .mutateAsync({ prompt, queuedInputId, runId: activeRunId })
+              .then(() => undefined)
+          : Promise.reject(new Error("活动 Run 不存在")),
+    }),
+    [
+      activeRunId,
+      abortMutation.mutateAsync,
+      followUpMutation.mutateAsync,
+      modelMutation.mutateAsync,
+      removeQueuedInputMutation.mutateAsync,
+      sessionId,
+      startMutation.mutateAsync,
+      steerMutation.mutateAsync,
+      steerQueuedInputMutation.mutateAsync,
+      updateQueuedInputMutation.mutateAsync,
+    ],
+  );
+
+  useEffect(() => {
+    if (!isSnapshotReady) return;
+    queryClient.setQueryData<readonly Session[]>(sessionQueryKeys.list(), (sessions) =>
+      sessions?.map((session) =>
+        session.id === sessionId && session.isRunning !== isSessionRunning
+          ? { ...session, isRunning: isSessionRunning }
+          : session,
+      ),
+    );
+  }, [isSessionRunning, isSnapshotReady, queryClient, sessionId]);
+
+  if (snapshotQuery.isPending) {
+    return <ChatPageSkeleton />;
+  }
+
+  if (snapshotQuery.isError && !snapshot) throw snapshotQuery.error;
+  if (!snapshot) return null;
+
+  return (
+    <>
+      <ChatNavbarActions>
+        <CommandTasksPopover commands={snapshot.commands} />
+      </ChatNavbarActions>
+      <div className="session-scrollbars relative h-[calc(100svh-var(--chat-navbar-height,64px))] overflow-hidden">
+        <div aria-hidden={!isPageReady} className="flex h-full flex-col" inert={!isPageReady}>
+          <div className="@container/conversation relative min-h-0 flex-1 overflow-hidden">
+            <AnimatePresence initial={false} mode="wait">
+              <motion.div
+                animate={{ opacity: 1, y: 0 }}
+                className="h-full"
+                exit={{ opacity: 0, y: -4 }}
+                initial={{ opacity: 0, y: 4 }}
+                key={activeView}
+                transition={transition}
+              >
+                {activeView === ChatPageView.CONVERSATION ? (
+                  <ChatConversation
+                    ref={handleConversationRef}
+                    className="session-scrollbar h-full min-h-0"
+                    style={{ overflowAnchor: "none" }}
+                    initial="instant"
+                    resize="instant"
+                    onPointerDown={(event) => {
+                      if (event.target === event.currentTarget) stopFollowingConversation();
+                    }}
+                    onScroll={(event) => {
+                      const conversation = event.currentTarget;
+                      const distanceFromBottom =
+                        conversation.scrollHeight -
+                        conversation.scrollTop -
+                        conversation.clientHeight;
+                      conversationScrollPositionRef.current = {
+                        isAtBottom: distanceFromBottom <= CHAT_AUTO_SCROLL_THRESHOLD_PX,
+                        scrollTop: conversation.scrollTop,
+                        sessionId,
+                      };
+                      const turnId =
+                        distanceFromBottom <= 1
+                          ? lastConversationTurnId
+                          : messageListRef.current?.getTurnIdAtOffset(
+                              conversation.scrollTop + conversation.clientHeight * 0.25,
+                            );
+                      if (turnId) {
+                        setActiveConversationTurn((current) =>
+                          current?.sessionId === sessionId && current.turnId === turnId
+                            ? current
+                            : { sessionId, turnId },
+                        );
+                      }
+                      const isNearBottom = distanceFromBottom <= CHAT_AUTO_SCROLL_THRESHOLD_PX;
+                      shouldFollowConversationRef.current = isNearBottom;
+                    }}
+                    onTouchMove={stopFollowingConversation}
+                    onWheel={(event) => {
+                      if (event.deltaY < 0) stopFollowingConversation();
+                    }}
+                  >
+                    <div ref={conversationContentRef} className="mx-auto flex w-full flex-col">
+                      <ThreadMessageList
+                        ref={messageListRef}
+                        messages={messages}
+                        onBeforeMessageEdit={stopFollowingConversation}
+                        onBeforeTurnNavigate={stopFollowingConversation}
+                        onSearchTargetComplete={clearSearchTarget}
+                        scrollContainerRef={conversationRef}
+                        scrollEndThreshold={CHAT_AUTO_SCROLL_THRESHOLD_PX}
+                        workspaceId={snapshot.session.workspaceId}
+                        workspaceRoot={snapshot.session.workspaceRoot}
+                        {...(isSessionRunning
+                          ? {}
+                          : {
+                              onRetryUserMessage: (messageEventId: string, prompt: string) =>
+                                retryMutation
+                                  .mutateAsync({ messageEventId, prompt, sessionId })
+                                  .then(() => undefined),
+                            })}
+                        {...(searchTarget ? { searchTarget } : {})}
+                      />
+                    </div>
+                    <ChatConversation.ScrollButton aria-label="滚动到底部" />
+                    <ChatConversation.ScrollAnchor />
+                  </ChatConversation>
+                ) : activeView === ChatPageView.TRACE ? (
+                  <ChatTraceView sessionId={sessionId} />
+                ) : (
+                  <WorkspaceFilesView workspaceId={snapshot.session.workspaceId} />
+                )}
+              </motion.div>
+            </AnimatePresence>
+            {activeView === ChatPageView.CONVERSATION ? (
+              <ConversationTurnToc
+                activeTurnId={
+                  activeConversationTurn?.sessionId === sessionId
+                    ? activeConversationTurn.turnId
+                    : null
+                }
+                messageListRef={messageListRef}
+                messages={messages}
+              />
+            ) : null}
+          </div>
+
+          <div className="relative z-10 shrink-0 bg-background px-4 pb-2">
+            {activeView === ChatPageView.CONVERSATION ? (
+              <div
+                aria-hidden
+                className="pointer-events-none absolute inset-x-0 bottom-full h-16 bg-linear-to-b from-transparent to-background"
+              />
+            ) : null}
+            <div className="mx-auto w-full max-w-[714px]">
+              <WorkingStatePanel
+                plan={workingState.plan}
+                todoRevision={workingState.todoRevision}
+                todos={workingState.todos}
+              />
+              <div className="relative z-10">
+                <div inert={pendingApproval !== undefined || pendingUserInput !== null}>
+                  <ChatComposer
+                    className="w-full"
+                    conversationId={snapshot.session.id}
+                    events={events}
+                    modelId={snapshot.session.modelId}
+                    providerId={snapshot.session.providerId}
+                    queuedInputs={queuedInputsQuery.data ?? EMPTY_QUEUED_INPUTS}
+                    status={status}
+                    thinkingLevel={snapshot.session.thinkingLevel}
+                    usage={usage}
+                    workspaceId={snapshot.session.workspaceId}
+                    {...composerActions}
+                  />
+                </div>
+                <AnimatePresence initial={false}>
+                  {pendingUserInput && activeRunId ? (
+                    <motion.div
+                      animate={{ opacity: 1, y: 0 }}
+                      className="absolute inset-x-0 bottom-0 z-20"
+                      exit={{ opacity: 0, y: 4 }}
+                      initial={{ opacity: 0, y: 4 }}
+                      transition={transition}
+                    >
+                      <UserInputCard
+                        key={pendingUserInput.inputId}
+                        {...(pendingInputAgentName === undefined
+                          ? {}
+                          : { agentName: pendingInputAgentName })}
+                        request={pendingUserInput}
+                        onCancel={() =>
+                          pendingUserInput.executionId
+                            ? abortSubAgent(sessionId, pendingUserInput.executionId)
+                            : abortMutation.mutateAsync(activeRunId)
+                        }
+                        onResolve={(submission) =>
+                          inputMutation.mutateAsync({
+                            inputId: pendingUserInput.inputId,
+                            runId: activeRunId,
+                            submission,
+                          })
+                        }
+                      />
+                    </motion.div>
+                  ) : pendingApproval && pendingApprovalTool ? (
+                    <motion.div
+                      animate={{ opacity: 1, y: 0 }}
+                      className="absolute inset-x-0 bottom-0 z-20 min-h-full"
+                      exit={{ opacity: 0, y: 4 }}
+                      initial={{ opacity: 0, y: 4 }}
+                      transition={transition}
+                    >
+                      <ToolApprovalCard
+                        key={pendingApproval.approvalId}
+                        approval={pendingApproval}
+                        toolName={pendingApprovalTool.toolName}
+                        onResolve={(approval, decision) =>
+                          approvalMutation.mutateAsync({
+                            approvalId: approval.approvalId,
+                            decision,
+                            runId: approval.runId,
+                          })
+                        }
+                      />
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
+            </div>
+          </div>
+        </div>
+        {isPageReady ? null : (
+          <div className="absolute inset-0 z-30 bg-background">
+            <ChatPageSkeleton />
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
