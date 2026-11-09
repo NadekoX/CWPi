@@ -15,7 +15,11 @@ import {
 import { buildContextCompactionPrompt } from "../prompts/context-compaction-prompt.js";
 import { buildApprovedPlanContractPrompt } from "../prompts/plan-mode-prompt.js";
 import { isHarnessUserMessage } from "../user-input.js";
-import { estimateContextUsage, estimateMessageTokens } from "../utils/context-usage.js";
+import {
+  copyAssistantWithStaleUsage,
+  estimateContextUsage,
+  estimateMessageTokens,
+} from "../utils/context-usage.js";
 import { preserveSkillInstructions } from "../utils/skill-context.js";
 import { limitUserInputContext } from "../utils/user-input.js";
 
@@ -39,6 +43,8 @@ export interface ContextProjectionInput {
   checkpoint: ContextCompactedData | null;
   checkpointTailStartMessageIndex?: number;
   compactionReason?: ContextCompactionReason;
+  // 压缩发生时的完整对话长度，区别于 checkpoint 覆盖旧消息的结束位置。
+  messageCountAtCompaction?: number;
   messages: readonly AgentMessage[];
   model: Model<Api>;
   onCompactionStarted?: () => Promise<void>;
@@ -376,6 +382,7 @@ function buildProjectedMessages(
   checkpoint: ContextCompactedData,
   tailStartMessageIndex: number,
   activeRunStartMessageIndex: number,
+  messageCountAtCompaction = tailStartMessageIndex,
 ): AgentMessage[] {
   const projected: AgentMessage[] = [createCheckpointMessage(checkpoint)];
   if (activeRunStartMessageIndex < tailStartMessageIndex) {
@@ -385,7 +392,13 @@ function buildProjectedMessages(
   projected.push(
     ...preserveSkillInstructions(messages, activeRunStartMessageIndex, tailStartMessageIndex),
   );
-  projected.push(...messages.slice(tailStartMessageIndex));
+  for (const [offset, message] of messages.slice(tailStartMessageIndex).entries()) {
+    projected.push(
+      message.role === "assistant" && tailStartMessageIndex + offset < messageCountAtCompaction
+        ? copyAssistantWithStaleUsage(message)
+        : message,
+    );
+  }
   return projected;
 }
 
@@ -444,6 +457,7 @@ export async function projectContext(
           input.checkpoint,
           tailStartMessageIndex,
           input.activeRunStartMessageIndex,
+          input.messageCountAtCompaction ?? limited.length,
         );
   const currentWithPlan = appendPlanContract(current, input.planContract);
   const beforeTokens = estimateProjectedTokens(currentWithPlan, input.systemPrompt, input.tools);
@@ -500,6 +514,7 @@ export async function projectContext(
       compacted,
       compacted.sourceMessageCount,
       input.activeRunStartMessageIndex,
+      limited.length,
     ),
     input.planContract,
   );

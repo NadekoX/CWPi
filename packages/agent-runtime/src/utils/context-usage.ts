@@ -1,9 +1,17 @@
-import type { Context, Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Message } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt, getCurrentTools, normalizeContext } from "@earendil-works/pi-ai";
 import type { RunContextData, RunContextUsageData } from "../harness-event.js";
 
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN = 3;
 const APPROXIMATE_IMAGE_TOKENS = 1_200;
+const assistantsWithStaleUsage = new WeakSet<AssistantMessage>();
+
+/** 标记请求投影中的副本，供预算和请求快照共用。原始消息的计费用量仍可用于审计。 */
+export function copyAssistantWithStaleUsage(message: AssistantMessage): AssistantMessage {
+  const projected = { ...message };
+  assistantsWithStaleUsage.add(projected);
+  return projected;
+}
 
 export interface ContextUsageEstimate {
   conversationTokens: number;
@@ -70,6 +78,7 @@ function estimateConversationTokens(messages: readonly Message[], prefixTokens: 
   for (const [index, message] of messages.entries()) {
     if (
       message.role === "assistant" &&
+      !assistantsWithStaleUsage.has(message) &&
       message.timestamp >= latestPrefixTimestamp &&
       message.stopReason !== "aborted" &&
       message.stopReason !== "error"

@@ -424,7 +424,11 @@ export class SessionEventStore {
         ) {
           throw new Error("Session context checkpoint parent is invalid");
         }
-        const record = { data: compactedData, eventSeq: event.seq };
+        const record = {
+          data: compactedData,
+          eventSeq: event.seq,
+          messageCountAtCompaction: messages.length,
+        };
         contextCheckpointHistory.push(record);
         contextCheckpointRecord = record;
         contextCheckpointTailStartMessageIndex = null;

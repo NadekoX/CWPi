@@ -555,11 +555,14 @@ export class SubAgentTree {
         });
       };
       let checkpoint: ContextCompactedData | null = null;
+      let messageCountAtCompaction = 0;
       agent.transformContext = async (messages, contextSignal) => {
+        const history = conversationMessages(messages);
         const projected = await projectContext({
           activeRunStartMessageIndex: 0,
           checkpoint,
-          messages: conversationMessages(messages),
+          messageCountAtCompaction,
+          messages: history,
           model,
           onCompactionStarted: async () => {
             requestCount += 1;
@@ -577,6 +580,7 @@ export class SubAgentTree {
         if (projected.error) throw new Error(`SUBAGENT_CONTEXT_EXCEEDED: ${projected.error}`);
         if (projected.compacted) {
           checkpoint = projected.compacted;
+          messageCountAtCompaction = history.length;
           if (projected.compacted.compactionUsage) {
             this.executions
               .get(executionId)

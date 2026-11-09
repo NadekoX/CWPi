@@ -177,29 +177,33 @@ async function evaluateJsonlRecovery(): Promise<void> {
         timestamp: 1,
       }),
     );
-    await writer.append(createEvent(2, HarnessEventType.CONTEXT_COMPACTED, first));
-    await writer.append(createEvent(3, HarnessEventType.CONTEXT_COMPACTED, second));
     await writer.append(
-      createEvent(4, HarnessEventType.MESSAGE_COMPLETED, {
+      createEvent(2, HarnessEventType.MESSAGE_COMPLETED, createAssistantResponse("保留在尾部")),
+    );
+    await writer.append(createEvent(3, HarnessEventType.CONTEXT_COMPACTED, first));
+    await writer.append(createEvent(4, HarnessEventType.CONTEXT_COMPACTED, second));
+    await writer.append(
+      createEvent(5, HarnessEventType.MESSAGE_COMPLETED, {
         content: [{ text: "恢复前的后续分支", type: "text" }],
         role: "user",
-        timestamp: 4,
+        timestamp: 5,
       }),
     );
     await writer.append(
-      createEvent(5, HarnessEventType.CONTEXT_CHECKPOINT_RESTORED, { sourceEventSeq: 2 }),
+      createEvent(6, HarnessEventType.CONTEXT_CHECKPOINT_RESTORED, { sourceEventSeq: 3 }),
     );
 
     const restarted = new SessionEventStore(directory);
     const restored = await restarted.load(SESSION_ID);
     assert.equal(restored.contextCheckpoint?.compactionId, "checkpoint-1");
-    assert.equal(restored.contextCheckpointEventSeq, 2);
+    assert.equal(restored.contextCheckpointEventSeq, 3);
     assert.equal(restored.contextCheckpointHistory.length, 2);
-    assert.equal(restored.contextCheckpointTailStartMessageIndex, 2);
+    assert.equal(restored.contextCheckpointHistory[0]?.messageCountAtCompaction, 2);
+    assert.equal(restored.contextCheckpointTailStartMessageIndex, 3);
 
     await appendFile(join(directory, `${SESSION_ID}.jsonl`), '{"crash":', "utf8");
     const afterCrash = await new SessionEventStore(directory).load(SESSION_ID);
-    assert.equal(afterCrash.lastPersistedSeq, 5);
+    assert.equal(afterCrash.lastPersistedSeq, 6);
     assert.equal(afterCrash.contextCheckpoint?.compactionId, "checkpoint-1");
   } finally {
     await rm(directory, { force: true, recursive: true });
@@ -266,7 +270,11 @@ async function evaluateCompactionScenarios(): Promise<void> {
   const observedOptions: SimpleStreamOptions[] = [];
   const observedContexts: TranscriptContext[] = [];
   const streamFn = createStreamFn(responses, observedOptions, observedContexts);
-  const firstHistory = createHistory(14);
+  const firstHistory = createHistory(14).map((message) =>
+    message.role === "assistant"
+      ? { ...message, usage: { ...message.usage, input: 5_750, output: 50, totalTokens: 5_800 } }
+      : message,
+  );
   const first = await projectContext({
     activeRunStartMessageIndex: 0,
     compactionReason: ContextCompactionReason.MILESTONE,
@@ -283,7 +291,9 @@ async function evaluateCompactionScenarios(): Promise<void> {
   assert.ok(first.compacted, "首次长上下文应触发压缩");
   assert.equal(first.compacted.compactionReason, ContextCompactionReason.MILESTONE);
   assert.equal(first.compacted.compactionStrategy, ContextCompactionStrategy.MODEL);
-  assert.ok(first.compacted.beforeTokens > first.compacted.afterTokens);
+  assert.equal(first.error, undefined, "保留回复的历史用量不能触发压缩后超限");
+  assert.equal(first.compacted.beforeTokens, 5_805);
+  assert.ok(first.compacted.afterTokens < 2_000);
   const firstCoveredEnd = first.compacted.coveredMessageRange?.end;
   if (firstCoveredEnd === undefined) throw new Error("首次压缩缺少消息范围");
   assert.equal(getCurrentSystemPrompt(observedContexts[0]?.messages ?? []), "评估上下文运行时");
@@ -292,6 +302,27 @@ async function evaluateCompactionScenarios(): Promise<void> {
     observedContexts[0]?.messages.filter((message) => message.role !== "system").slice(0, -1),
     firstHistory.slice(0, firstCoveredEnd),
   );
+
+  const checkpoint = first.compacted;
+  const projectAfterCompaction = (messages: AgentMessage[]) =>
+    projectContext({
+      activeRunStartMessageIndex: 0,
+      checkpoint,
+      messageCountAtCompaction: firstHistory.length,
+      messages,
+      model,
+      plan: null,
+      sessionId: SESSION_ID,
+      streamFn,
+      systemPrompt: "评估上下文运行时",
+      todos: null,
+      tools: [],
+    });
+  assert.deepEqual(await projectAfterCompaction(firstHistory), { messages: first.messages });
+  const freshReply = createAssistantResponse("压缩后生成的新回复");
+  freshReply.usage = { ...freshReply.usage, input: 5_050, totalTokens: 5_100 };
+  const afterFreshReply = await projectAfterCompaction([...firstHistory, freshReply]);
+  assert.match(afterFreshReply.error ?? "", /5100 tokens/);
 
   const stableCheckpoint = createCheckpoint();
   const stableMessages: AgentMessage[] = [
@@ -398,6 +429,7 @@ async function evaluateCompactionScenarios(): Promise<void> {
   const second = await projectContext({
     activeRunStartMessageIndex: secondHistory.length - 1,
     checkpoint: first.compacted,
+    messageCountAtCompaction: firstHistory.length,
     messages: secondHistory,
     model,
     plan: null,
@@ -427,6 +459,7 @@ async function evaluateCompactionScenarios(): Promise<void> {
   const timeout = await projectContext({
     activeRunStartMessageIndex: secondHistory.length - 1,
     checkpoint: first.compacted,
+    messageCountAtCompaction: firstHistory.length,
     messages: secondHistory,
     model,
     plan: null,
@@ -448,6 +481,7 @@ async function evaluateCompactionScenarios(): Promise<void> {
       (message.role === "toolResult" && message.toolCallId === "atomic-call-0"),
   );
   assert.equal(atomicTail.length, 2);
+  assert.deepEqual(atomicTail, firstHistory.slice(-2), "投影保留回复内容与计费用量");
 }
 
 await evaluateCompactionScenarios();

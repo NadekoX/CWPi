@@ -352,6 +352,7 @@ export interface ContextCompactedData {
 export interface ContextCheckpointRecord {
   data: ContextCompactedData;
   eventSeq: number;
+  messageCountAtCompaction: number;
 }
 
 export interface ContextCheckpointRestoredData {

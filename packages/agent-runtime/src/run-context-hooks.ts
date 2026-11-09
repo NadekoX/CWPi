@@ -144,6 +144,10 @@ export class RunContextHooks {
         );
         this.pendingWorkingStateReset = false;
       }
+      const history = conversationMessages(messages);
+      const checkpointRecord = this.contextCheckpointHistory.findLast(
+        (record) => record.eventSeq === this.contextCheckpointEventSeq,
+      );
       // 调用真正的 Context Pipeline（真正的 Token 计算、裁剪和压缩都在这里）
       const projected = await projectContext({
         /**
@@ -182,7 +186,10 @@ export class RunContextHooks {
               checkpointTailStartMessageIndex: this.contextCheckpointTailStartMessageIndex,
             }),
         // 完整消息，Context Pipeline 根据 contextWindow 和 maxTokens 算出真正的输入预算
-        messages: conversationMessages(messages),
+        messages: history,
+        ...(checkpointRecord === undefined
+          ? {}
+          : { messageCountAtCompaction: checkpointRecord.messageCountAtCompaction }),
         model: this.options.agent.state.model,
         // 压缩开始事件，projectContext() 只有确认确实需要压缩后，才调用它
         // 主要用于展示压缩状态的（web ui）
@@ -221,6 +228,7 @@ export class RunContextHooks {
         this.contextCheckpointHistory.push({
           data: projected.compacted,
           eventSeq: event.seq,
+          messageCountAtCompaction: history.length,
         });
       }
       this.pendingContextError = projected.error ?? null;
